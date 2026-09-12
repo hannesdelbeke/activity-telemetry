@@ -19,7 +19,15 @@ export default class ActivityCollectorExtension extends Extension {
         this._dbus = Gio.DBusExportedObject.wrapJSObject(INTERFACE, this);
         this._dbus.export(Gio.DBus.session, '/org/activitycollector/Telemetry');
 
-        this._ownerId = Gio.DBus.session.own_name(
+        // g_bus_own_name_on_connection is a free function, not a method on
+        // GDBusConnection, so introspection exposes it as Gio.bus_own_name_on_connection
+        // rather than Gio.DBus.session.own_name. Calling the latter throws a
+        // TypeError out of enable(), and the shell then refuses to load the
+        // extension at all, which looks identical to the extension not being
+        // installed. The well-known name is what makes --dest= resolvable, so
+        // without it the collector could never reach the object either.
+        this._ownerId = Gio.bus_own_name_on_connection(
+            Gio.DBus.session,
             'org.activitycollector.Telemetry',
             Gio.BusNameOwnerFlags.NONE,
             null,
@@ -28,13 +36,15 @@ export default class ActivityCollectorExtension extends Extension {
     }
 
     disable() {
+        // disable() runs on lock, not just on uninstall, so every field has to
+        // be dropped or the extension leaks its bus name across lock/unlock.
+        if (this._ownerId) {
+            Gio.bus_unown_name(this._ownerId);
+            this._ownerId = null;
+        }
         if (this._dbus) {
             this._dbus.unexport();
             this._dbus = null;
-        }
-        if (this._ownerId) {
-            Gio.DBus.session.unown_name(this._ownerId);
-            this._ownerId = null;
         }
     }
 
