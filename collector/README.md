@@ -20,9 +20,13 @@ application detection differ.
 
 ## Status
 
-The repository contains the protocol and spool foundation plus adapter
-interfaces. OS adapters should be enabled only after reviewing the platform
-permissions and privacy settings for the intended machine.
+Linux, macOS, and Windows adapters exist, along with the spool, the batch
+protocol, and a startup service for each platform. Only the macOS adapter
+reports a real `activity_state`; Linux and Windows still report `active`
+unconditionally, so that field is not yet comparable across machines.
+
+Review the platform permissions and privacy settings for a machine before
+enabling collection on it.
 
 ## Configuration
 
@@ -35,8 +39,13 @@ Environment variables:
 | `ACTIVITY_INGEST_URL` | no | Batch ingest endpoint; HTTPS outside a trusted LAN |
 | `ACTIVITY_WRITE_TOKEN` | no | Device-scoped write token |
 | `ACTIVITY_INTERVAL_SECONDS` | no | Poll interval; defaults to 30 |
+| `ACTIVITY_SPOOL_RETENTION_DAYS` | no | Days to keep events the sink has confirmed; defaults to 7 |
 
 Do not commit tokens or machine-specific configuration.
+
+The collector never deletes an event the sink has not acknowledged. An ingest
+failure is logged and retried on the next interval, so a sink that is down or
+unreachable costs latency, not data.
 
 ## Run
 
@@ -59,15 +68,51 @@ Idle is reported after `IDLE_AFTER_SECONDS` in `adapters.py`, 300 by default.
 This is currently the only adapter that reports a real `activity_state`; Linux
 and Windows report `active` unconditionally.
 
-### Linux user service
+## Install as a startup service
 
-Copy `systemd/activity-collector.service` to
-`~/.config/systemd/user/`, create `~/.config/activity-collector/env` with a
-generic `ACTIVITY_MACHINE_ID`, then run:
+Each installer generates its own unit against wherever the repository actually
+sits, creates the config file, and starts the collector at login. All three
+leave the collector spooling locally and uploading nothing until
+`ACTIVITY_INGEST_URL` and `ACTIVITY_WRITE_TOKEN` are filled in.
 
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now activity-collector.service
+### macOS (launchd)
+
+```sh
+sh collector/macos/install.sh
+$EDITOR ~/.config/activity-collector/env     # set the ingest URL and token
+launchctl kickstart -k gui/$(id -u)/com.activity-collector
+```
+
+Logs go to `~/Library/Logs/activity-collector.log`. The agent has `KeepAlive`
+set, so it restarts if the collector exits.
+
+### Linux (systemd user service)
+
+```sh
+sh collector/linux/install.sh
+$EDITOR ~/.config/activity-collector/env
+systemctl --user restart activity-collector
+```
+
+Logs go to `journalctl --user -u activity-collector -f`. The unit committed at
+`systemd/activity-collector.service` is a reference copy with a hardcoded
+checkout path; the installer generates the one that actually gets used.
+
+### Windows (Task Scheduler)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File collector\windows\install.ps1 `
+  -MachineId personal-windows -IngestUrl http://homeassistant.local:8788/api/ingest -WriteToken <token>
+Start-ScheduledTask -TaskName 'Activity Collector'
+```
+
+It runs under `pythonw.exe` so no console window opens at logon, and it refuses
+the Microsoft Store python, whose execution alias the scheduler cannot resolve.
+
+## Tests
+
+```sh
+python -m pytest collector/tests haos-addon/tests
 ```
 
 The service starts when the graphical user session starts and writes to the

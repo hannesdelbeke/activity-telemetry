@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
+import hmac
 import json
+import logging
 import os
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -13,6 +16,8 @@ from pathlib import Path
 MAX_BODY = 256 * 1024
 MAX_EVENTS = 100
 DB_PATH = Path(os.environ.get("ACTIVITY_DB", "/data/activity.db"))
+
+
 def _option(name: str) -> str | None:
     value = os.environ.get("ACTIVITY_WRITE_TOKEN") if name == "write_token" else os.environ.get(name)
     if value:
@@ -28,9 +33,12 @@ def _option(name: str) -> str | None:
 WRITE_TOKEN = _option("write_token")
 
 
-def _database() -> sqlite3.Connection:
+@contextmanager
+def _database() -> Iterator[sqlite3.Connection]:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(DB_PATH)
+    # timeout, because ThreadingHTTPServer can land two writers at once and the
+    # sqlite default gives up after five seconds with "database is locked".
+    db = sqlite3.connect(DB_PATH, timeout=30)
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -44,7 +52,11 @@ def _database() -> sqlite3.Connection:
         )
         """
     )
-    return db
+    try:
+        with db:
+            yield db
+    finally:
+        db.close()
 
 
 def _valid_event(event: object) -> bool:
@@ -85,16 +97,29 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/api/ingest":
             self._respond(404, {"error": "not_found"})
             return
-        if not WRITE_TOKEN or self.headers.get("Authorization") != f"Bearer {WRITE_TOKEN}":
+        # compare_digest rather than ==, so a wrong token cannot be recovered a
+        # byte at a time from how long the comparison took.
+        offered = self.headers.get("Authorization", "")
+        if not WRITE_TOKEN or not hmac.compare_digest(offered, f"Bearer {WRITE_TOKEN}"):
             self._respond(401, {"error": "unauthorized"})
             return
-        length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0 or length > MAX_BODY:
-            self._respond(413, {"error": "invalid_body_size"})
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            # A non-numeric header used to raise out of the handler as a 500.
+            self._respond(400, {"error": "invalid_content_length"})
+            return
+        if length <= 0:
+            self._respond(400, {"error": "empty_body"})
+            return
+        if length > MAX_BODY:
+            self._respond(413, {"error": "body_too_large"})
             return
         try:
+            # ValueError, not JSONDecodeError: a non-UTF-8 body raises
+            # UnicodeDecodeError here, which used to reach the client as a 500.
             payload = json.loads(self.rfile.read(length))
-        except json.JSONDecodeError:
+        except ValueError:
             self._respond(400, {"error": "invalid_json"})
             return
         events = payload.get("events") if isinstance(payload, dict) else None
@@ -102,29 +127,42 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(400, {"error": "invalid_events"})
             return
         received_at = datetime.now(timezone.utc).isoformat()
-        with _database() as db:
-            for event in events:
-                db.execute(
-                    """
-                    INSERT OR IGNORE INTO events
-                    (event_id, schema_version, occurred_at, machine_id, event_type, payload_json, received_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        event["event_id"],
-                        event["schema_version"],
-                        event["occurred_at"],
-                        event["machine_id"],
-                        event["event_type"],
-                        json.dumps(event, separators=(",", ":")),
-                        received_at,
-                    ),
-                )
+        try:
+            with _database() as db:
+                for event in events:
+                    db.execute(
+                        """
+                        INSERT OR IGNORE INTO events
+                        (event_id, schema_version, occurred_at, machine_id, event_type, payload_json, received_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            event["event_id"],
+                            event["schema_version"],
+                            event["occurred_at"],
+                            event["machine_id"],
+                            event["event_type"],
+                            json.dumps(event, separators=(",", ":")),
+                            received_at,
+                        ),
+                    )
+        except sqlite3.Error:
+            # 503, not 202: the collector keeps the batch spooled and retries,
+            # where a false 202 would drop it.
+            logging.exception("could not write %s events to %s", len(events), DB_PATH)
+            self._respond(503, {"error": "storage_unavailable"})
+            return
         self._respond(202, {"accepted": len(events)})
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     port = int(os.environ.get("ACTIVITY_PORT", "8788"))
+    if not WRITE_TOKEN:
+        # Previously this started and rejected every request with 401, with
+        # nothing in the log saying why.
+        logging.warning("no write_token set, every ingest request will be rejected with 401")
+    logging.info("listening on 0.0.0.0:%s, storing events in %s", port, DB_PATH)
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 

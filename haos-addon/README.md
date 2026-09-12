@@ -29,9 +29,17 @@ Events land in `/data/activity.db`, inside the add-on's own persistent volume.
 {"events": [{"event_id": "...", "schema_version": 1, "...": "..."}]}
 ```
 
-The bearer token is configured with `ACTIVITY_WRITE_TOKEN`. Requests are
-validated for size, event shape, timestamps, and schema version. Event IDs are
-idempotent.
+The bearer token is the add-on's `write_token` option, or `ACTIVITY_WRITE_TOKEN`
+outside Home Assistant, and is compared in constant time. Requests are validated
+for size, event shape, timestamps, and schema version. Event IDs are idempotent.
+
+| Status | Meaning |
+| --- | --- |
+| 202 | Batch stored; `accepted` counts the events in it |
+| 400 | Malformed body, unparseable JSON, or an event that failed validation |
+| 401 | Missing, wrong, or unconfigured write token |
+| 413 | Body over 256 KiB |
+| 503 | Could not write to SQLite; the collector keeps the batch and retries |
 
 `GET /health`
 
@@ -60,10 +68,20 @@ policy.
 
 ## Local development
 
+`ACTIVITY_DB` matters here: the default is `/data/activity.db`, which only
+exists inside the add-on container and fails with a permission error anywhere
+else.
+
 ```bash
-ACTIVITY_WRITE_TOKEN=local-token python -m activity_sink
+ACTIVITY_WRITE_TOKEN=local-token ACTIVITY_DB=./activity.db python src/activity_sink.py
 curl -X POST http://127.0.0.1:8788/api/ingest \
   -H 'Authorization: Bearer local-token' \
   -H 'Content-Type: application/json' \
   -d '{"events":[]}'
+```
+
+Tests, from the repository root:
+
+```bash
+python -m pytest haos-addon/tests collector/tests
 ```

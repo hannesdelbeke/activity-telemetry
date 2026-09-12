@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
 
@@ -25,9 +27,24 @@ class Spool:
                 )
                 """
             )
+            # pending() runs once per interval forever, so it gets an index
+            # rather than a growing scan.
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS events_pending ON events (occurred_at) "
+                "WHERE synced_at IS NULL"
+            )
 
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path)
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        # sqlite3's own context manager commits but never closes, and this runs
+        # in a loop that is meant to outlive the machine's uptime, so the close
+        # is explicit rather than left to the garbage collector.
+        db = sqlite3.connect(self.path, timeout=10)
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
 
     def add(self, event: dict) -> None:
         with self._connect() as db:
@@ -61,3 +78,20 @@ class Spool:
                 "UPDATE events SET synced_at = datetime('now') WHERE event_id = ?",
                 ((event_id,) for event_id in event_ids),
             )
+
+    def prune_synced(self, older_than_days: int) -> int:
+        """Drop events the sink has confirmed. Unsent events are never touched.
+
+        Without this the spool grows forever: at the default 30s interval it
+        gains about a million rows a year, none of which is read again once the
+        sink has them.
+        """
+        if older_than_days < 0:
+            return 0
+        with self._connect() as db:
+            deleted = db.execute(
+                "DELETE FROM events WHERE synced_at IS NOT NULL "
+                "AND synced_at < datetime('now', ?)",
+                (f"-{older_than_days} days",),
+            ).rowcount
+        return deleted
