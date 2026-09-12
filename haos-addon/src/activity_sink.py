@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 MAX_BODY = 256 * 1024
 MAX_EVENTS = 100
@@ -123,6 +123,34 @@ def _read_day(day: date, machine: str | None) -> list[dict]:
     return events
 
 
+def _by_machine(events: list[dict]) -> dict[str, list[dict]]:
+    per_machine: dict[str, list[dict]] = {}
+    for event in events:
+        per_machine.setdefault(event["machine_id"], []).append(event)
+    return per_machine
+
+
+def _gaps(samples: list[dict]) -> list[float]:
+    return [
+        (later["at"] - earlier["at"]).total_seconds()
+        for earlier, later in zip(samples, samples[1:])
+    ]
+
+
+def _cap(gaps: list[float]) -> float:
+    """The most one sample may be charged for.
+
+    Three intervals, so one missed beat still counts but an outage does not. The
+    interval is inferred rather than configured, because the sink never learns
+    what the collector was told to use.
+
+    The summary and the timeline both call this. They used to hold separate
+    copies of the rule -- one in Python, one in JavaScript -- which is two
+    things to keep in step and, on the JavaScript side, nothing to test it with.
+    """
+    return min(900.0, max(60.0, 3 * statistics.median(gaps))) if gaps else 60.0
+
+
 def _summarise(events: list[dict]) -> dict:
     """Turn point samples into durations by charging each sample the gap to the next.
 
@@ -130,21 +158,13 @@ def _summarise(events: list[dict]) -> dict:
     next sample is capped, because a laptop that closes at noon and reopens at
     five should not report five hours of whatever was on screen at noon.
     """
-    per_machine: dict[str, list[dict]] = {}
-    for event in events:
-        per_machine.setdefault(event["machine_id"], []).append(event)
+    per_machine = _by_machine(events)
 
     apps: dict[str, float] = {}
     states: dict[str, float] = {}
     for samples in per_machine.values():
-        gaps = [
-            (later["at"] - earlier["at"]).total_seconds()
-            for earlier, later in zip(samples, samples[1:])
-        ]
-        # Cap at three intervals, so one missed beat still counts but an outage
-        # does not. The interval is inferred rather than configured, because the
-        # sink never learns what the collector was told to use.
-        cap = min(900.0, max(60.0, 3 * statistics.median(gaps))) if gaps else 60.0
+        gaps = _gaps(samples)
+        cap = _cap(gaps)
         for sample, gap in zip(samples, gaps + [0.0]):
             charged = min(gap, cap)
             apps[sample["app"]] = apps.get(sample["app"], 0.0) + charged
@@ -163,13 +183,97 @@ def _duration(seconds: float) -> str:
     return f"{minutes // 60}h {minutes % 60:02d}m" if minutes >= 60 else f"{minutes}m"
 
 
+SECONDS_PER_DAY = 86400.0
+
+
+def _segments(events: list[dict], day: date) -> list[tuple[str, list[dict]]]:
+    """One bar per sample, placed as a percentage across the local day.
+
+    Each bar starts where its sample landed and runs for the same capped gap the
+    summary charges it, so the two views cannot disagree about how long anything
+    took. A sample that would spill past midnight is clipped rather than allowed
+    to overhang the track, which happens whenever the last sample of the day
+    falls inside the cap of the end of it.
+    """
+    midnight = datetime.combine(day, datetime.min.time(), _local_zone())
+
+    timeline = []
+    for machine, samples in sorted(_by_machine(events).items()):
+        gaps = _gaps(samples)
+        cap = _cap(gaps)
+        bars = []
+        for sample, gap in zip(samples, gaps + [0.0]):
+            charged = min(gap, cap)
+            # The final sample of each machine is charged nothing, exactly as in
+            # the summary, so it draws no bar rather than a zero-width sliver.
+            if charged <= 0:
+                continue
+            left = (sample["at"] - midnight).total_seconds() / SECONDS_PER_DAY * 100
+            width = charged / SECONDS_PER_DAY * 100
+            bars.append(
+                {
+                    "left": left,
+                    "width": min(width, 100.0 - left),
+                    "at": sample["at"],
+                    "app": sample["app"],
+                    "state": sample["activity_state"],
+                    "seconds": charged,
+                }
+            )
+        timeline.append((machine, bars))
+    return timeline
+
+
+def _link(keep: dict, **params: object) -> str:
+    """A relative query-string href.
+
+    Relative is not a style choice. Home Assistant serves the panel under a
+    generated Ingress prefix, so a leading slash leaves the add-on altogether
+    and lands on HA core's own authenticated endpoints.
+
+    Values are percent-encoded before the whole href is escaped, because
+    machine_id arrives from a client and one containing `&` would otherwise
+    split into a second query parameter.
+    """
+    merged = {**keep, **params}
+    query = "&".join(
+        f"{key}={quote(str(value), safe='')}" for key, value in merged.items() if value is not None
+    )
+    return html.escape(f"?{query}" if query else "?")
+
+
+def _nav(day: date, machine: str | None, machines: list[str], view: str | None) -> str:
+    """Date arrows, machine tabs and the summary/timeline toggle, shared by both views.
+
+    Shared so the two pages cannot drift into disagreeing about which day or
+    which machine you are looking at when you switch between them.
+    """
+    keep = {"machine": machine, "view": view}
+    tabs = "".join(
+        f'<a class="tab{" on" if name == machine else ""}" '
+        f'href="{_link(keep, date=day, machine=name)}">{html.escape(name)}</a>'
+        for name in machines
+    )
+    if tabs:
+        on = "" if machine else " on"
+        tabs = f'<a class="tab{on}" href="{_link(keep, date=day, machine=None)}">all</a>' + tabs
+
+    other = None if view == "timeline" else "timeline"
+    toggle = (
+        f'<a class="tab" href="{_link(keep, date=day, view=other)}">'
+        f'{"Summary" if view == "timeline" else "Timeline"}</a>'
+    )
+
+    return f"""<nav>
+ <a href="{_link(keep, date=day - timedelta(days=1))}">&larr;</a>
+ <strong>{day:%a %d %b %Y}</strong>
+ <a href="{_link(keep, date=day + timedelta(days=1))}">&rarr;</a>
+ <span style="flex:1"></span>{toggle}{tabs}
+</nav>"""
+
+
 def _page(day: date, machine: str | None, summary: dict, recent: list[dict]) -> bytes:
     longest = max((seconds for _, seconds in summary["apps"]), default=0.0) or 1.0
-    keep = {"machine": machine} if machine else {}
-
-    def link(**params: object) -> str:
-        query = "&".join(f"{key}={html.escape(str(value))}" for key, value in {**keep, **params}.items())
-        return html.escape(f"?{query}" if query else "?")
 
     rows = "".join(
         f'<tr><td>{html.escape(app)}</td><td class="n">{_duration(seconds)}</td>'
@@ -182,15 +286,6 @@ def _page(day: date, machine: str | None, summary: dict, recent: list[dict]) -> 
         f'<td>{html.escape(event["activity_state"])}</td><td>{html.escape(event["machine_id"])}</td></tr>'
         for event in recent
     )
-
-    tabs = "".join(
-        f'<a class="tab{" on" if name == machine else ""}" href="{html.escape(f"?date={day}&machine={name}")}">{html.escape(name)}</a>'
-        for name in summary["machines"]
-    )
-    if machine:
-        tabs = f'<a class="tab" href="{html.escape(f"?date={day}")}">all</a>' + tabs
-    elif tabs:
-        tabs = '<a class="tab on" href="?">all</a>' + tabs
 
     return f"""<!doctype html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -213,12 +308,7 @@ def _page(day: date, machine: str | None, summary: dict, recent: list[dict]) -> 
  .empty {{ opacity: .6; padding: 1rem 0; }}
 </style>
 <h1>Activity</h1>
-<nav>
- <a href="{link(date=day - timedelta(days=1))}">&larr;</a>
- <strong>{day:%a %d %b %Y}</strong>
- <a href="{link(date=day + timedelta(days=1))}">&rarr;</a>
- <span style="flex:1"></span>{tabs}
-</nav>
+{_nav(day, machine, summary["machines"], None)}
 <p class="lede">
  {_duration(summary["states"].get("active", 0.0))} active
  &middot; {_duration(summary["states"].get("idle", 0.0))} idle
@@ -226,6 +316,71 @@ def _page(day: date, machine: str | None, summary: dict, recent: list[dict]) -> 
 </p>
 <table><tr><th>App</th><th>Time</th><th></th></tr>{rows}</table>
 {f'<table><tr><th>Last seen</th><th>App</th><th>State</th><th>Machine</th></tr>{tail}</table>' if tail else ''}
+""".encode()
+
+
+def _timeline_page(day: date, machine: str | None, timeline: list, machines: list[str]) -> bytes:
+    ticks = "".join(
+        f'<span style="left:{hour / 24 * 100:.4f}%">{hour:02d}</span>' for hour in range(0, 24, 3)
+    )
+
+    rows = ""
+    for name, bars in timeline:
+        drawn = "".join(
+            # The state decides a class name, so it is mapped to a fixed set
+            # rather than interpolated: activity_state arrives from a client and
+            # anything client-controlled inside an attribute is an injection.
+            f'<i class="{"active" if bar["state"] == "active" else "idle" if bar["state"] == "idle" else "other"}"'
+            f' style="left:{bar["left"]:.4f}%;width:{bar["width"]:.4f}%"'
+            f' title="{html.escape(f"{bar['at']:%H:%M} {bar['app']} ({bar['state']}, {_duration(bar['seconds'])})")}"></i>'
+            for bar in bars
+        )
+        rows += f'<div class="lab">{html.escape(name)}</div><div class="track">{drawn}</div>'
+
+    if not rows:
+        rows = '<div class="lab"></div><div class="empty">No events for this day.</div>'
+
+    return f"""<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Activity timeline {day}</title>
+<style>
+ :root {{ color-scheme: light dark; }}
+ body {{ font: 15px/1.5 system-ui, sans-serif; margin: 0 auto; padding: 1.5rem; max-width: 60rem; }}
+ h1 {{ font-size: 1.3rem; margin: 0 0 .25rem; }}
+ nav {{ display: flex; gap: .75rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; }}
+ a {{ color: inherit; }}
+ .tab {{ text-decoration: none; opacity: .55; }}
+ .tab.on {{ opacity: 1; font-weight: 600; }}
+ /* One grid for the axis and every track, so the hour labels and the bars
+    below them share a column definition and cannot drift out of alignment. */
+ .grid {{ display: grid; grid-template-columns: 7rem 1fr; gap: .4rem .75rem; align-items: center; }}
+ .axis {{ position: relative; height: 1.1rem; font-size: .72rem; opacity: .6; font-variant-numeric: tabular-nums; }}
+ .axis span {{ position: absolute; transform: translateX(-50%); }}
+ .axis span:first-child {{ transform: none; }}
+ .lab {{ text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .8; }}
+ .track {{ position: relative; height: 1.5rem; border-radius: .25rem;
+   background: repeating-linear-gradient(to right,
+     color-mix(in srgb, currentColor 9%, transparent) 0 1px,
+     color-mix(in srgb, currentColor 4%, transparent) 1px 12.5%); }}
+ .track i {{ position: absolute; top: 0; height: 100%; border-radius: .15rem; background: currentColor; }}
+ .track i.active {{ opacity: .62; }}
+ .track i.idle {{ opacity: .22; }}
+ .track i.other {{ opacity: .22; }}
+ .empty {{ opacity: .6; padding: 1rem 0; }}
+ .key {{ display: flex; gap: 1.25rem; margin-top: 1.5rem; font-size: .85rem; opacity: .75; }}
+ .key span {{ display: inline-block; width: 1.6rem; height: .7rem; border-radius: .15rem;
+   background: currentColor; vertical-align: middle; margin-right: .4rem; }}
+</style>
+<h1>Activity</h1>
+{_nav(day, machine, machines, "timeline")}
+<div class="grid">
+ <div></div><div class="axis">{ticks}</div>
+ {rows}
+</div>
+<div class="key">
+ <div><span style="opacity:.62"></span>active</div>
+ <div><span style="opacity:.22"></span>idle</div>
+</div>
 """.encode()
 
 
@@ -238,7 +393,7 @@ class ReadHandler(BaseHTTPRequestHandler):
     device write token still cannot read anybody's history back out.
     """
 
-    server_version = "activity-sink/0.2"
+    server_version = "activity-sink/0.3"
 
     def log_message(self, fmt: str, *args: object) -> None:
         logging.debug("ingress %s", fmt % args)
@@ -247,6 +402,7 @@ class ReadHandler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         query = parse_qs(url.query)
         machine = (query.get("machine") or [None])[0]
+        view = (query.get("view") or [None])[0]
         try:
             day = date.fromisoformat(query["date"][0]) if "date" in query else None
         except (ValueError, IndexError):
@@ -272,7 +428,12 @@ class ReadHandler(BaseHTTPRequestHandler):
         # summary is computed before the filter narrows the table.
         summary = _summarise(events)
         summary["machines"] = _summarise(_read_day(day, None))["machines"]
-        self._send(200, _page(day, machine, summary, events[-12:][::-1]), "text/html; charset=utf-8")
+
+        if view == "timeline":
+            body = _timeline_page(day, machine, _segments(events, day), summary["machines"])
+        else:
+            body = _page(day, machine, summary, events[-12:][::-1])
+        self._send(200, body, "text/html; charset=utf-8")
 
     def _send(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)
@@ -283,7 +444,7 @@ class ReadHandler(BaseHTTPRequestHandler):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "activity-sink/0.2"
+    server_version = "activity-sink/0.3"
 
     def _respond(self, status: int, payload: dict) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode()

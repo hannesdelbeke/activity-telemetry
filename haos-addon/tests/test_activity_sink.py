@@ -196,6 +196,102 @@ def test_the_panel_escapes_an_app_name_from_a_client(panel, server) -> None:
     assert b"&lt;script&gt;" in body
 
 
+def test_a_bar_starts_where_its_sample_landed_and_runs_for_the_charged_gap() -> None:
+    from datetime import date
+
+    samples = [_sample(0, "chrome"), _sample(60, "chrome"), _sample(120, "terminal")]
+    (machine, bars), = activity_sink._segments(samples, date(2026, 1, 1))
+
+    from datetime import datetime as dt
+
+    assert machine == "m1"
+    # Midnight UTC is not midnight locally, so the expected position is measured
+    # from the same local midnight the page renders against rather than assumed
+    # to be zero. Hardcoding 0.0 here passes only in UTC.
+    local = samples[0]["at"].astimezone(activity_sink._local_zone())
+    midnight = dt.combine(date(2026, 1, 1), dt.min.time(), activity_sink._local_zone())
+    assert bars[0]["left"] == pytest.approx((local - midnight).total_seconds() / 864.0)
+    # The gap to the next sample is an hour, but _cap tops a single sample out
+    # at 900s, so the bar is fifteen minutes of the 24 hour track and not an
+    # hour of it. A bar wider than its cap is the visual form of the outage bug
+    # the summary already guards against.
+    assert bars[0]["width"] == pytest.approx(900 / 864.0)
+    # Two bars, not three: the last sample of a machine is charged nothing.
+    assert len(bars) == 2
+
+
+def test_the_timeline_and_the_summary_agree_on_how_long_things_took() -> None:
+    """The two views are the same numbers drawn differently, so they share _cap.
+
+    They used to hold the rule twice, once in Python and once in JavaScript.
+    This is the test that would have caught the copies drifting.
+    """
+    from datetime import date
+
+    samples = [_sample(minute, "chrome") for minute in range(5)] + [_sample(600, "chrome")]
+    summary = dict(activity_sink._summarise(samples)["apps"])
+    drawn = sum(bar["seconds"] for _, bars in activity_sink._segments(samples, date(2026, 1, 1)) for bar in bars)
+    assert drawn == pytest.approx(summary["chrome"])
+
+
+def test_a_bar_is_clipped_at_midnight_rather_than_overhanging_the_track() -> None:
+    from datetime import date
+
+    # A sample just before midnight whose capped gap would run past it.
+    samples = [_sample(23 * 60 + 59, "chrome"), _sample(24 * 60 + 30, "chrome")]
+    (_, bars), = activity_sink._segments(samples, date(2026, 1, 1))
+    for bar in bars:
+        assert bar["left"] + bar["width"] <= 100.0 + 1e-9
+
+
+def test_an_empty_day_draws_no_tracks() -> None:
+    from datetime import date
+
+    assert activity_sink._segments([], date(2026, 1, 1)) == []
+
+
+def test_the_timeline_renders_and_links_stay_relative(panel, server) -> None:
+    event = _event(occurred_at=activity_sink.datetime.now(activity_sink.timezone.utc).isoformat())
+    assert _post(server, json.dumps({"events": [event]}).encode()) == 202
+
+    status, body = _get(panel + "/?view=timeline")
+    assert status == 200
+    assert b'class="track"' in body
+    # Ingress mounts the panel under a generated prefix, so an href starting at
+    # the root leaves the add-on and hits Home Assistant's own endpoints.
+    assert b'href="/' not in body
+
+
+def test_the_summary_and_the_timeline_link_to_each_other(panel) -> None:
+    assert b"view=timeline" in _get(panel + "/")[1]
+    assert b"Summary" in _get(panel + "/?view=timeline")[1]
+
+
+def test_the_timeline_escapes_hostile_values_from_a_client(panel, server) -> None:
+    hostile = _event(
+        event_id="xss-timeline",
+        machine_id='m"><script>alert(1)</script>',
+        data={"app": '<img src=x onerror=alert(1)>', "activity_state": '"><script>alert(1)</script>'},
+    )
+    hostile["occurred_at"] = activity_sink.datetime.now(activity_sink.timezone.utc).isoformat()
+    assert _post(server, json.dumps({"events": [hostile]}).encode()) == 202
+
+    body = _get(panel + "/?view=timeline")[1]
+    assert b"<script>alert(1)</script>" not in body
+    assert b"onerror=alert(1)" not in body
+
+
+def test_a_machine_name_with_an_ampersand_stays_one_parameter(panel, server) -> None:
+    # Unencoded, `a&b` would split the href into a second query parameter and
+    # the tab would filter on `a` instead.
+    event = _event(event_id="amp", machine_id="a&b")
+    event["occurred_at"] = activity_sink.datetime.now(activity_sink.timezone.utc).isoformat()
+    assert _post(server, json.dumps({"events": [event]}).encode()) == 202
+
+    body = _get(panel + "/")[1].decode()
+    assert "machine=a%26b" in body
+
+
 def test_the_json_endpoint_returns_the_days_events(panel, server) -> None:
     event = _event(occurred_at=activity_sink.datetime.now(activity_sink.timezone.utc).isoformat())
     assert _post(server, json.dumps({"events": [event]}).encode()) == 202

@@ -1,5 +1,5 @@
 name: Activity Sink
-version: "0.2.0"
+version: "0.3.0"
 slug: activity_sink
 description: Append-only local activity event sink
 startup: services
