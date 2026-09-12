@@ -53,3 +53,73 @@ def test_activity_state_defaults_to_active_when_ioreg_says_nothing(monkeypatch):
 def test_darwin_selects_the_mac_adapter(monkeypatch):
     monkeypatch.setattr(adapters.platform, "system", lambda: "Darwin")
     assert isinstance(adapters.create_adapter(), adapters.MacAdapter)
+
+
+def test_linux_activity_state_uses_x11_screensaver_when_available(monkeypatch):
+    monkeypatch.setattr(adapters.LinuxAdapter, "_x11_screensaver_idle", lambda: 100_000)
+    assert adapters.LinuxAdapter._activity_state() == "active"
+
+    monkeypatch.setattr(adapters.LinuxAdapter, "_x11_screensaver_idle", lambda: 301_000)
+    assert adapters.LinuxAdapter._activity_state() == "idle"
+
+
+def test_linux_activity_state_falls_back_to_xprintidle(monkeypatch):
+    monkeypatch.setattr(adapters.LinuxAdapter, "_x11_screensaver_idle", lambda: None)
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: cmd == "xprintidle" and "/usr/bin/xprintidle")
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: "100000")
+    assert adapters.LinuxAdapter._activity_state() == "active"
+
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: "301000")
+    assert adapters.LinuxAdapter._activity_state() == "idle"
+
+
+def test_linux_activity_state_falls_back_to_gdbus_for_wayland(monkeypatch):
+    monkeypatch.setattr(adapters.LinuxAdapter, "_x11_screensaver_idle", lambda: None)
+    which_results = {"gdbus": "/usr/bin/gdbus"}
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: which_results.get(cmd))
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: "(uint64 100000,)")
+    assert adapters.LinuxAdapter._activity_state() == "active"
+
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: "(uint64 301000,)")
+    assert adapters.LinuxAdapter._activity_state() == "idle"
+
+
+def test_linux_activity_state_defaults_to_active_when_no_mechanism_available(monkeypatch):
+    monkeypatch.setattr(adapters.LinuxAdapter, "_x11_screensaver_idle", lambda: None)
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: None)
+    assert adapters.LinuxAdapter._activity_state() == "active"
+
+
+def test_linux_activity_state_survives_xprintidle_failure(monkeypatch):
+    monkeypatch.setattr(adapters.LinuxAdapter, "_x11_screensaver_idle", lambda: None)
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: cmd == "xprintidle" and "/usr/bin/xprintidle")
+
+    def explode(*_args, **_kwargs):
+        raise FileNotFoundError("xprintidle")
+
+    monkeypatch.setattr(subprocess, "check_output", explode)
+    assert adapters.LinuxAdapter._activity_state() == "active"
+
+
+def test_linux_activity_state_survives_gdbus_failure(monkeypatch):
+    monkeypatch.setattr(adapters.LinuxAdapter, "_x11_screensaver_idle", lambda: None)
+    which_results = {"gdbus": "/usr/bin/gdbus"}
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: which_results.get(cmd))
+
+    def explode(*_args, **_kwargs):
+        raise subprocess.SubprocessError("gdbus failed")
+
+    monkeypatch.setattr(subprocess, "check_output", explode)
+    assert adapters.LinuxAdapter._activity_state() == "active"
+
+
+def test_linux_x11_screensaver_idle_returns_none_when_libraries_missing(monkeypatch):
+    import ctypes.util
+
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
+    assert adapters.LinuxAdapter._x11_screensaver_idle() is None
+
+
+def test_linux_selects_the_linux_adapter(monkeypatch):
+    monkeypatch.setattr(adapters.platform, "system", lambda: "Linux")
+    assert isinstance(adapters.create_adapter(), adapters.LinuxAdapter)

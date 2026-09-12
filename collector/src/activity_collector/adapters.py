@@ -9,7 +9,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 
-# Seconds without a keyboard or pointer event before macOS is reported idle.
+# Seconds without a keyboard or pointer event before the system is reported idle.
 IDLE_AFTER_SECONDS = 300
 
 
@@ -44,7 +44,7 @@ class LinuxAdapter(Adapter):
                     app = window[:128]
             except (OSError, subprocess.SubprocessError):
                 pass
-        return Snapshot(app, "active")
+        return Snapshot(app, self._activity_state())
 
     @staticmethod
     def _x11_app() -> str:
@@ -69,6 +69,102 @@ class LinuxAdapter(Adapter):
             return "unknown"
         values = re.findall(r'"([^"]*)"', properties)
         return (values[-1] if values else "unknown")[:128] or "unknown"
+
+    @staticmethod
+    def _activity_state() -> str:
+        # Try X11 via XScreenSaver extension first.
+        idle_ms = LinuxAdapter._x11_screensaver_idle()
+        if idle_ms is not None:
+            return "idle" if idle_ms >= IDLE_AFTER_SECONDS * 1000 else "active"
+
+        # Fall back to xprintidle if available.
+        if shutil.which("xprintidle"):
+            try:
+                output = subprocess.check_output(
+                    ["xprintidle"],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                ).strip()
+                idle_ms = int(output)
+                return "idle" if idle_ms >= IDLE_AFTER_SECONDS * 1000 else "active"
+            except (OSError, subprocess.SubprocessError, ValueError):
+                pass
+
+        # Best-effort Wayland via GNOME Mutter IdleMonitor.
+        if shutil.which("gdbus"):
+            try:
+                output = subprocess.check_output(
+                    [
+                        "gdbus",
+                        "call",
+                        "--session",
+                        "--dest=org.gnome.Mutter.IdleMonitor",
+                        "--object-path=/org/gnome/Mutter/IdleMonitor/Core",
+                        "--method=org.gnome.Mutter.IdleMonitor.GetIdletime",
+                    ],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                ).strip()
+                # Output is '(uint64 12345,)' — extract the number.
+                match = re.search(r"\(uint64 (\d+),\)", output)
+                if match:
+                    idle_ms = int(match.group(1))
+                    return "idle" if idle_ms >= IDLE_AFTER_SECONDS * 1000 else "active"
+            except (OSError, subprocess.SubprocessError, ValueError):
+                pass
+
+        return "active"
+
+    @staticmethod
+    def _x11_screensaver_idle() -> int | None:
+        """Return idle milliseconds from XScreenSaver extension, or None if unavailable."""
+        try:
+            import ctypes
+            import ctypes.util
+
+            # Load X11 libraries.
+            x11_path = ctypes.util.find_library("X11")
+            xss_path = ctypes.util.find_library("Xss")
+            if not x11_path or not xss_path:
+                return None
+
+            x11 = ctypes.CDLL(x11_path)
+            xss = ctypes.CDLL(xss_path)
+
+            class XScreenSaverInfo(ctypes.Structure):
+                _fields_ = [
+                    ("window", ctypes.c_ulong),
+                    ("state", ctypes.c_int),
+                    ("kind", ctypes.c_int),
+                    ("til_or_since", ctypes.c_ulong),
+                    ("idle", ctypes.c_ulong),
+                    ("eventMask", ctypes.c_ulong),
+                ]
+
+            # Open the default display.
+            display = x11.XOpenDisplay(None)
+            if not display:
+                return None
+
+            try:
+                # Allocate info structure.
+                info = xss.XScreenSaverAllocInfo()
+                if not info:
+                    return None
+
+                try:
+                    # Query idle time.
+                    xss.XScreenSaverQueryInfo(display, x11.XDefaultRootWindow(display), info)
+                    idle_ms = ctypes.cast(info, ctypes.POINTER(XScreenSaverInfo)).contents.idle
+                    return int(idle_ms)
+                finally:
+                    x11.XFree(info)
+            finally:
+                x11.XCloseDisplay(display)
+        except (OSError, AttributeError, ValueError):
+            return None
 
 
 class WindowsAdapter(Adapter):

@@ -21,9 +21,8 @@ application detection differ.
 ## Status
 
 Linux, macOS, and Windows adapters exist, along with the spool, the batch
-protocol, and a startup service for each platform. Only the macOS adapter
-reports a real `activity_state`; Linux and Windows still report `active`
-unconditionally, so that field is not yet comparable across machines.
+protocol, and a startup service for each platform. The macOS and Linux adapters
+report real `activity_state`; Windows still reports `active` unconditionally.
 
 Review the platform permissions and privacy settings for a machine before
 enabling collection on it.
@@ -71,11 +70,20 @@ the frontmost process through System Events would, which is why `lsappinfo` is
 used instead. Only the application name is read, never the window title.
 
 Idle is reported after `IDLE_AFTER_SECONDS` in `adapters.py`, 300 by default.
-This is currently the only adapter that reports a real `activity_state`; Linux
-and Windows report `active` unconditionally. On Linux, X11 and Xwayland
-sessions identify the active application's `WM_CLASS` without reading a window
-title. Native Wayland windows may still report `unknown`, because Wayland
-doesn't expose a universal foreground-window API to ordinary clients.
+
+### Linux
+
+The Linux adapter identifies the active application's `WM_CLASS` via `xprop`
+and `xdotool` on X11 and Xwayland, never reading the window title. Native
+Wayland windows may still report `unknown` because Wayland doesn't expose a
+universal foreground-window API to ordinary clients.
+
+Idle detection tries the XScreenSaver extension via ctypes first (X11 only),
+falls back to `xprintidle` if present, then tries GNOME's Mutter IdleMonitor
+over `gdbus` for Wayland. If none of these mechanisms are available, the
+adapter reports `active` unconditionally rather than failing — the collector
+runs unattended and must degrade gracefully on headless servers or minimal
+environments. Idle is reported after the same 300-second threshold as macOS.
 
 ## Install as a startup service
 
