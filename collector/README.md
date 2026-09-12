@@ -72,7 +72,10 @@ used instead. Only the application name is read, never the window title.
 
 Idle is reported after `IDLE_AFTER_SECONDS` in `adapters.py`, 300 by default.
 This is currently the only adapter that reports a real `activity_state`; Linux
-and Windows report `active` unconditionally.
+and Windows report `active` unconditionally. On Linux, X11 and Xwayland
+sessions identify the active application's `WM_CLASS` without reading a window
+title. Native Wayland windows may still report `unknown`, because Wayland
+doesn't expose a universal foreground-window API to ordinary clients.
 
 ## Install as a startup service
 

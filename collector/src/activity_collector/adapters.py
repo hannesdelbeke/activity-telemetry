@@ -31,7 +31,7 @@ class GenericAdapter(Adapter):
 
 class LinuxAdapter(Adapter):
     def snapshot(self) -> Snapshot:
-        app = "unknown"
+        app = self._x11_app()
         if shutil.which("xdotool"):
             try:
                 window = subprocess.check_output(
@@ -45,6 +45,30 @@ class LinuxAdapter(Adapter):
             except (OSError, subprocess.SubprocessError):
                 pass
         return Snapshot(app, "active")
+
+    @staticmethod
+    def _x11_app() -> str:
+        """Read only the X11 WM_CLASS for the active window, never its title."""
+        try:
+            active = subprocess.check_output(
+                ["xprop", "-root", "_NET_ACTIVE_WINDOW"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            match = re.search(r"window id # (0x[0-9a-fA-F]+)", active)
+            if match is None:
+                return "unknown"
+            properties = subprocess.check_output(
+                ["xprop", "-id", match.group(1), "WM_CLASS"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return "unknown"
+        values = re.findall(r'"([^"]*)"', properties)
+        return (values[-1] if values else "unknown")[:128] or "unknown"
 
 
 class WindowsAdapter(Adapter):
