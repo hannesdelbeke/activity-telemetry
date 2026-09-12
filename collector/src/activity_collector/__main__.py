@@ -30,12 +30,9 @@ def _event(machine_id: str, app: str, state: str) -> dict:
 
 def _post(url: str, token: str, events: list[dict]) -> None:
     body = json.dumps({"events": events}).encode()
-    request = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        method="POST",
-    )
+    request = urllib.request.Request(url, data=body, method="POST")
+    request.add_header("Authorization", "Bearer " + token)
+    request.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(request, timeout=10) as response:
         if response.status not in (200, 201, 202):
             raise RuntimeError(f"ingest returned HTTP {response.status}")
