@@ -107,8 +107,10 @@ class LinuxAdapter(Adapter):
                     stderr=subprocess.DEVNULL,
                     timeout=2,
                 ).strip()
-                # Output is '(uint64 12345,)' — extract the number.
-                match = re.search(r"\(uint64 (\d+),\)", output)
+                # gdbus prints the return tuple as GVariant, '(uint64 12345,)'.
+                # Match just the scalar, so spacing or a future extra member in
+                # the tuple does not silently turn idle detection off.
+                match = re.search(r"uint64\s+(\d+)", output)
                 if match:
                     idle_ms = int(match.group(1))
                     return "idle" if idle_ms >= IDLE_AFTER_SECONDS * 1000 else "active"
@@ -124,16 +126,19 @@ class LinuxAdapter(Adapter):
             import ctypes
             import ctypes.util
 
-            # Load X11 libraries.
-            x11_path = ctypes.util.find_library("X11")
-            xss_path = ctypes.util.find_library("Xss")
-            if not x11_path or not xss_path:
-                return None
+            # find_library shells out to ldconfig, gcc or objdump, none of which
+            # a slim container is obliged to ship, so it returns None on machines
+            # that do have the libraries. The sonames are stable, so try them
+            # before giving up.
+            x11_path = ctypes.util.find_library("X11") or "libX11.so.6"
+            xss_path = ctypes.util.find_library("Xss") or "libXss.so.1"
 
             x11 = ctypes.CDLL(x11_path)
             xss = ctypes.CDLL(xss_path)
 
             class XScreenSaverInfo(ctypes.Structure):
+                """Matches the XScreenSaverInfo in <X11/extensions/scrnsaver.h>."""
+
                 _fields_ = [
                     ("window", ctypes.c_ulong),
                     ("state", ctypes.c_int),
@@ -143,22 +148,54 @@ class LinuxAdapter(Adapter):
                     ("eventMask", ctypes.c_ulong),
                 ]
 
-            # Open the default display.
+            # Every restype below has to be declared. ctypes assumes a function
+            # returns int, so on 64-bit Linux an undeclared Display* comes back
+            # truncated to its low 32 bits, and handing that back to
+            # XScreenSaverQueryInfo dereferences a corrupt pointer. That is a
+            # SIGSEGV, which no `except` here can catch: it would take the whole
+            # collector down every poll, and the service manager would restart it
+            # into the same crash.
+            info_p = ctypes.POINTER(XScreenSaverInfo)
+            int_p = ctypes.POINTER(ctypes.c_int)
+            x11.XOpenDisplay.restype = ctypes.c_void_p
+            x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+            x11.XDefaultRootWindow.restype = ctypes.c_ulong
+            x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+            x11.XFree.argtypes = [ctypes.c_void_p]
+            xss.XScreenSaverQueryExtension.restype = ctypes.c_int
+            xss.XScreenSaverQueryExtension.argtypes = [ctypes.c_void_p, int_p, int_p]
+            xss.XScreenSaverAllocInfo.restype = info_p
+            xss.XScreenSaverQueryInfo.restype = ctypes.c_int
+            xss.XScreenSaverQueryInfo.argtypes = [ctypes.c_void_p, ctypes.c_ulong, info_p]
+
             display = x11.XOpenDisplay(None)
             if not display:
                 return None
 
             try:
-                # Allocate info structure.
+                # A display can exist without the extension compiled into the
+                # server. Asking first is what separates "X11 cannot answer this"
+                # from "the user is at the keyboard", so the caller can fall
+                # through to xprintidle or gdbus instead of trusting a stale zero.
+                event_base, error_base = ctypes.c_int(), ctypes.c_int()
+                if not xss.XScreenSaverQueryExtension(
+                    display, ctypes.byref(event_base), ctypes.byref(error_base)
+                ):
+                    return None
+
                 info = xss.XScreenSaverAllocInfo()
                 if not info:
                     return None
-
                 try:
-                    # Query idle time.
-                    xss.XScreenSaverQueryInfo(display, x11.XDefaultRootWindow(display), info)
-                    idle_ms = ctypes.cast(info, ctypes.POINTER(XScreenSaverInfo)).contents.idle
-                    return int(idle_ms)
+                    # QueryInfo leaves the struct untouched when it fails, so
+                    # without this check a failure reads back as zero idle
+                    # milliseconds, which is indistinguishable from real activity.
+                    if not xss.XScreenSaverQueryInfo(
+                        display, x11.XDefaultRootWindow(display), info
+                    ):
+                        return None
+                    return int(info.contents.idle)
                 finally:
                     x11.XFree(info)
             finally:
