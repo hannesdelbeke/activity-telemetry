@@ -2,5 +2,5 @@
   "uuid": "activity-collector@hannesdelbeke.github.io",
   "name": "Activity Collector",
   "description": "Exposes focused window application name and idle time over D-Bus for privacy-preserving activity telemetry. Never reads window titles.",
-  "shell-version": ["45", "46", "47", "48"]
+  "shell-version": ["45", "46", "47", "48", "49", "50"]
 }
