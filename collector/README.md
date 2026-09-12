@@ -8,13 +8,13 @@ URLs, screen contents, notifications, or message contents.
 
 ## Design
 
-- One Python codebase for Linux and Windows.
+- One Python codebase for Linux, macOS, and Windows.
 - OS-specific adapters live behind the same collector interface.
 - SQLite local spool means collection continues while offline.
 - Events are sent in bounded batches to an append-only HTTPS endpoint.
 - No server read credentials are stored on the client.
 
-Separate Windows and Linux repositories are not needed: the protocol, spool,
+Separate per-OS repositories are not needed: the protocol, spool,
 configuration, and privacy behavior are shared. Only idle-time and foreground
 application detection differ.
 
@@ -32,7 +32,7 @@ Environment variables:
 | --- | --- | --- |
 | `ACTIVITY_MACHINE_ID` | yes | Non-identifying device label |
 | `ACTIVITY_SPOOL` | no | SQLite path; defaults to a user cache path |
-| `ACTIVITY_INGEST_URL` | no | HTTPS batch endpoint |
+| `ACTIVITY_INGEST_URL` | no | Batch ingest endpoint; HTTPS outside a trusted LAN |
 | `ACTIVITY_WRITE_TOKEN` | no | Device-scoped write token |
 | `ACTIVITY_INTERVAL_SECONDS` | no | Poll interval; defaults to 30 |
 
@@ -46,6 +46,18 @@ python -m activity_collector
 
 The default collector is intentionally dry-run/local-only until an ingest URL
 and write token are configured.
+
+### macOS
+
+The macOS adapter reads the foreground application name with `lsappinfo` and
+idle time from the `IOHIDSystem` registry entry with `ioreg`. Both ship with
+the OS, and neither needs an Accessibility or Screen Recording grant — reading
+the frontmost process through System Events would, which is why `lsappinfo` is
+used instead. Only the application name is read, never the window title.
+
+Idle is reported after `IDLE_AFTER_SECONDS` in `adapters.py`, 300 by default.
+This is currently the only adapter that reports a real `activity_state`; Linux
+and Windows report `active` unconditionally.
 
 ### Linux user service
 

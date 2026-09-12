@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import platform
+import re
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
+
+# Seconds without a keyboard or pointer event before macOS is reported idle.
+IDLE_AFTER_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -57,12 +61,63 @@ class WindowsAdapter(Adapter):
             return Snapshot("windows", "active")
 
 
+class MacAdapter(Adapter):
+    def snapshot(self) -> Snapshot:
+        return Snapshot(self._front_app(), self._activity_state())
+
+    @staticmethod
+    def _front_app() -> str:
+        # lsappinfo needs no Accessibility grant, where reading the frontmost
+        # process through System Events does. It names the application only,
+        # never the window title.
+        try:
+            asn = subprocess.check_output(
+                ["lsappinfo", "front"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            ).strip()
+            if not asn:
+                return "unknown"
+            info = subprocess.check_output(
+                ["lsappinfo", "info", "-only", "name", asn],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            ).strip()
+        except (OSError, subprocess.SubprocessError):
+            return "unknown"
+        # The answer is '"LSDisplayName"="Terminal"'; keep the value.
+        _, _, name = info.partition("=")
+        return name.strip().strip('"')[:128] or "unknown"
+
+    @staticmethod
+    def _activity_state() -> str:
+        try:
+            registry = subprocess.check_output(
+                ["ioreg", "-n", "IOHIDSystem", "-r", "-d", "1"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return "active"
+        match = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', registry)
+        if match is None:
+            return "active"
+        # HIDIdleTime counts nanoseconds since the last keyboard or pointer event.
+        idle_seconds = int(match.group(1)) / 1_000_000_000
+        return "idle" if idle_seconds >= IDLE_AFTER_SECONDS else "active"
+
+
 def create_adapter() -> Adapter:
     system = platform.system()
     if system == "Linux":
         return LinuxAdapter()
     if system == "Windows":
         return WindowsAdapter()
+    if system == "Darwin":
+        return MacAdapter()
     return GenericAdapter()
 
 
