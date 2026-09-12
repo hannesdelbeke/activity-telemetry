@@ -57,7 +57,10 @@ cat > "$plist" <<PLIST
   <key>Label</key><string>$label</string>
   <key>ProgramArguments</key>
   <array><string>/bin/sh</string><string>$wrapper</string></array>
-  <key>WorkingDirectory</key><string>$collector</string>
+  <!-- Nothing reads the working directory, and pointing it into the checkout
+       makes every start log a getcwd error when the repository sits under a
+       TCC-protected folder such as ~/Documents. -->
+  <key>WorkingDirectory</key><string>$config</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>30</integer>
