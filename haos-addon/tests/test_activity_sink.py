@@ -109,3 +109,98 @@ def test_events_are_stored_once(server) -> None:
 
     rows = sqlite3.connect(activity_sink.DB_PATH).execute("SELECT COUNT(*) FROM events").fetchone()
     assert rows[0] == 1
+
+
+def _sample(minutes: int, app: str, state: str = "active", machine: str = "m1") -> dict:
+    from datetime import datetime, timedelta, timezone
+
+    return {
+        "at": datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=minutes),
+        "machine_id": machine,
+        "app": app,
+        "activity_state": state,
+    }
+
+
+def test_a_sample_is_charged_the_gap_to_the_next_one() -> None:
+    samples = [_sample(0, "chrome"), _sample(1, "chrome"), _sample(2, "terminal")]
+    summary = activity_sink._summarise(samples)
+    # Two minute-long gaps: chrome holds both ends of the first, terminal is
+    # last and so is charged nothing.
+    assert dict(summary["apps"]) == {"chrome": 120.0, "terminal": 0.0}
+    assert summary["samples"] == 3
+
+
+def test_an_outage_is_not_counted_as_time_at_the_machine() -> None:
+    steady = [_sample(minute, "chrome") for minute in range(5)]
+    summary = activity_sink._summarise(steady + [_sample(600, "chrome")])
+    # The five-minute run plus one capped gap, not the ten hours of downtime.
+    assert summary["apps"][0][1] < 15 * 60
+
+
+def test_machines_are_summarised_independently() -> None:
+    samples = [
+        _sample(0, "chrome", machine="mac"),
+        _sample(1, "chrome", machine="mac"),
+        _sample(0, "vim", machine="linux"),
+        _sample(1, "vim", machine="linux"),
+    ]
+    summary = activity_sink._summarise(samples)
+    assert summary["machines"] == ["linux", "mac"]
+    assert dict(summary["apps"]) == {"chrome": 60.0, "vim": 60.0}
+
+
+def test_an_empty_day_summarises_without_dividing_by_zero() -> None:
+    assert activity_sink._summarise([]) == {"apps": [], "states": {}, "samples": 0, "machines": []}
+
+
+@pytest.fixture
+def panel(tmp_path, monkeypatch):
+    monkeypatch.setattr(activity_sink, "DB_PATH", tmp_path / "activity.db")
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), activity_sink.ReadHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    httpd.shutdown()
+    httpd.server_close()
+
+
+def _get(url: str) -> tuple[int, bytes]:
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read()
+
+
+def test_the_panel_renders_an_empty_day(panel) -> None:
+    status, body = _get(panel + "/")
+    assert status == 200
+    assert b"No events for this day." in body
+
+
+def test_an_unparseable_date_falls_back_to_today(panel) -> None:
+    assert _get(panel + "/?date=banana")[0] == 200
+    assert _get(panel + "/?date=2026-13-45")[0] == 200
+
+
+def test_the_panel_escapes_an_app_name_from_a_client(panel, server) -> None:
+    # The panel and the ingest server share DB_PATH through the same tmp_path.
+    hostile = _event(event_id="xss", data={"app": "<script>alert(1)</script>", "activity_state": "active"})
+    hostile["occurred_at"] = activity_sink.datetime.now(activity_sink.timezone.utc).isoformat()
+    assert _post(server, json.dumps({"events": [hostile]}).encode()) == 202
+
+    status, body = _get(panel + "/")
+    assert status == 200
+    assert b"<script>alert(1)</script>" not in body
+    assert b"&lt;script&gt;" in body
+
+
+def test_the_json_endpoint_returns_the_days_events(panel, server) -> None:
+    event = _event(occurred_at=activity_sink.datetime.now(activity_sink.timezone.utc).isoformat())
+    assert _post(server, json.dumps({"events": [event]}).encode()) == 202
+
+    status, body = _get(panel + "/api/events")
+    assert status == 200
+    payload = json.loads(body)
+    assert [item["app"] for item in payload["events"]] == ["example"]

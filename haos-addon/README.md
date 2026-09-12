@@ -21,6 +21,30 @@ add-on repository rather than by copying files into `/addons` by hand:
 The add-on builds locally on first install; `amd64` and `aarch64` are declared.
 Events land in `/data/activity.db`, inside the add-on's own persistent volume.
 
+Point collectors at the machine's IPv4 address rather than `homeassistant.local`.
+The hostname resolves to an IPv6 link-local address first and the published port
+is IPv4-only, so clients that prefer IPv6 see the connection reset.
+
+## Reading the data
+
+The add-on ships a read-only panel and registers it with Ingress, so it appears
+in the Home Assistant sidebar as **Activity** and is authenticated by Home
+Assistant rather than by a token of its own.
+
+It shows, per local day and optionally per machine, time spent in each
+application, the active/idle split, and the most recent samples. `GET
+/api/events` on the same panel returns the day as JSON for scripting.
+
+Durations are derived, not recorded. Each event says only which application was
+in front at one instant, so a sample is charged the gap until the next sample,
+capped at three times the median gap for that machine. An outage therefore
+costs the report accuracy but never invents hours that were not worked.
+
+The panel listens on `ingress_port` 8099, which `config.yaml` deliberately does
+not publish: it is reachable from the Supervisor network only. The ingest port
+serves no read endpoint, so a leaked device write token still cannot read
+history back out.
+
 ## API
 
 `POST /api/ingest`

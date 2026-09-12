@@ -43,6 +43,12 @@ Environment variables:
 
 Do not commit tokens or machine-specific configuration.
 
+Prefer the sink's IPv4 address to `homeassistant.local` in `ACTIVITY_INGEST_URL`.
+Home Assistant advertises an IPv6 link-local address over mDNS, clients try it
+first, and the add-on's published port is IPv4-only, so the connection is reset
+before the request is sent. The symptom is `Connection reset by peer` against
+the hostname while the same request to the address succeeds.
+
 The collector never deletes an event the sink has not acknowledged. An ingest
 failure is logged and retried on the next interval, so a sink that is down or
 unreachable costs latency, not data.
