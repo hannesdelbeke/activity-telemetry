@@ -74,16 +74,19 @@ Idle is reported after `IDLE_AFTER_SECONDS` in `adapters.py`, 300 by default.
 ### Linux
 
 The Linux adapter identifies the active application's `WM_CLASS` via `xprop`
-and `xdotool` on X11 and Xwayland, never reading the window title. Native
-Wayland windows may still report `unknown` because Wayland doesn't expose a
-universal foreground-window API to ordinary clients.
+and `xdotool` on X11 and Xwayland, never reading the window title. On native
+Wayland, the optional GNOME Shell extension reports a real application name
+when installed (`collector/linux/gnome-extension/`); without it, native Wayland
+windows still report `unknown` because Wayland doesn't expose a universal
+foreground-window API to ordinary clients.
 
-Idle detection tries the XScreenSaver extension via ctypes first (X11 only),
-falls back to `xprintidle` if present, then tries GNOME's Mutter IdleMonitor
-over `gdbus` for Wayland. If none of these mechanisms are available, the
-adapter reports `active` unconditionally rather than failing — the collector
-runs unattended and must degrade gracefully on headless servers or minimal
-environments. Idle is reported after the same 300-second threshold as macOS.
+Idle detection tries the GNOME Shell extension first (GNOME 45+ only), then the
+XScreenSaver extension via ctypes (X11 only), falls back to `xprintidle` if
+present, then tries GNOME's Mutter IdleMonitor over `gdbus`. If none of these
+mechanisms are available, the adapter reports `active` unconditionally rather
+than failing — the collector runs unattended and must degrade gracefully on
+headless servers or minimal environments. Idle is reported after the same
+300-second threshold as macOS.
 
 ## Install as a startup service
 

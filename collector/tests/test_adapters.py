@@ -269,3 +269,140 @@ def test_linux_gdbus_idle_tolerates_the_variant_spacing(monkeypatch):
 def test_linux_selects_the_linux_adapter(monkeypatch):
     monkeypatch.setattr(adapters.platform, "system", lambda: "Linux")
     assert isinstance(adapters.create_adapter(), adapters.LinuxAdapter)
+
+
+def test_linux_gnome_extension_supplies_app_name(monkeypatch):
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: cmd == "gdbus" and "/usr/bin/gdbus")
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: "('org.gnome.Terminal',)\n")
+    assert adapters.LinuxAdapter._gnome_extension_app() == "org.gnome.Terminal"
+
+
+def test_linux_gnome_extension_app_falls_back_on_unknown(monkeypatch):
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: cmd == "gdbus" and "/usr/bin/gdbus")
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: "('unknown',)\n")
+    assert adapters.LinuxAdapter._gnome_extension_app() == "unknown"
+
+
+def test_linux_gnome_extension_app_handles_empty_reply(monkeypatch):
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: cmd == "gdbus" and "/usr/bin/gdbus")
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: "('',)\n")
+    # empty string should be converted to "unknown"
+    assert adapters.LinuxAdapter._gnome_extension_app() == "unknown"
+
+
+def test_linux_gnome_extension_app_handles_malformed_reply(monkeypatch):
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: cmd == "gdbus" and "/usr/bin/gdbus")
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: "malformed output")
+    assert adapters.LinuxAdapter._gnome_extension_app() == "unknown"
+
+
+def test_linux_gnome_extension_app_returns_unknown_without_gdbus(monkeypatch):
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: None)
+    assert adapters.LinuxAdapter._gnome_extension_app() == "unknown"
+
+
+def test_linux_gnome_extension_app_survives_subprocess_failure(monkeypatch):
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: cmd == "gdbus" and "/usr/bin/gdbus")
+
+    def explode(*_args, **_kwargs):
+        raise subprocess.SubprocessError("gdbus failed")
+
+    monkeypatch.setattr(subprocess, "check_output", explode)
+    assert adapters.LinuxAdapter._gnome_extension_app() == "unknown"
+
+
+def test_linux_gnome_extension_idle_returns_milliseconds(monkeypatch):
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: cmd == "gdbus" and "/usr/bin/gdbus")
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: "(uint64 42000,)\n")
+    assert adapters.LinuxAdapter._gnome_extension_idle() == 42000
+
+
+def test_linux_gnome_extension_idle_treats_zero_as_unavailable(monkeypatch):
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: cmd == "gdbus" and "/usr/bin/gdbus")
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: "(uint64 0,)\n")
+    # 0 means no idle information, should return None to fall through
+    assert adapters.LinuxAdapter._gnome_extension_idle() is None
+
+
+def test_linux_gnome_extension_idle_tolerates_variant_spacing(monkeypatch):
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: cmd == "gdbus" and "/usr/bin/gdbus")
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: "(uint64  42000,)\n")
+    assert adapters.LinuxAdapter._gnome_extension_idle() == 42000
+
+
+def test_linux_gnome_extension_idle_returns_none_without_gdbus(monkeypatch):
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: None)
+    assert adapters.LinuxAdapter._gnome_extension_idle() is None
+
+
+def test_linux_gnome_extension_idle_survives_subprocess_failure(monkeypatch):
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: cmd == "gdbus" and "/usr/bin/gdbus")
+
+    def explode(*_args, **_kwargs):
+        raise subprocess.SubprocessError("gdbus failed")
+
+    monkeypatch.setattr(subprocess, "check_output", explode)
+    assert adapters.LinuxAdapter._gnome_extension_idle() is None
+
+
+def test_linux_gnome_extension_idle_handles_malformed_reply(monkeypatch):
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: cmd == "gdbus" and "/usr/bin/gdbus")
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: "malformed output")
+    assert adapters.LinuxAdapter._gnome_extension_idle() is None
+
+
+def test_linux_snapshot_prefers_gnome_extension_app_over_x11(monkeypatch):
+    # When the extension is available, it should be used and _x11_app not called
+    called_x11 = []
+
+    def mock_gnome_ext():
+        return "org.gnome.Nautilus"
+
+    def mock_x11():
+        called_x11.append(True)
+        return "should-not-see-this"
+
+    def mock_activity():
+        return "active"
+
+    monkeypatch.setattr(adapters.LinuxAdapter, "_gnome_extension_app", staticmethod(mock_gnome_ext))
+    monkeypatch.setattr(adapters.LinuxAdapter, "_activity_state", staticmethod(mock_activity))
+    monkeypatch.setattr(adapters.LinuxAdapter, "_x11_app", staticmethod(mock_x11))
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: None)
+
+    snapshot = adapters.LinuxAdapter().snapshot()
+    assert snapshot.app == "org.gnome.Nautilus"
+    assert len(called_x11) == 0  # _x11_app should not have been called
+
+
+def test_linux_snapshot_falls_back_to_x11_when_extension_unavailable(monkeypatch):
+    # When the extension returns unknown, fall back to X11
+    monkeypatch.setattr(adapters.LinuxAdapter, "_gnome_extension_app", staticmethod(lambda: "unknown"))
+    monkeypatch.setattr(adapters.LinuxAdapter, "_x11_app", staticmethod(lambda: "X11App"))
+    monkeypatch.setattr(adapters.LinuxAdapter, "_activity_state", staticmethod(lambda: "active"))
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: None)
+
+    snapshot = adapters.LinuxAdapter().snapshot()
+    assert snapshot.app == "X11App"
+
+
+def test_linux_activity_state_prefers_gnome_extension_idle_over_x11_screensaver(monkeypatch):
+    # When the extension is available, it should be tried first
+    monkeypatch.setattr(adapters.LinuxAdapter, "_gnome_extension_idle", lambda: 100_000)
+    called_x11_screensaver = []
+    monkeypatch.setattr(
+        adapters.LinuxAdapter,
+        "_x11_screensaver_idle",
+        lambda: called_x11_screensaver.append(True) or 999_999,
+    )
+
+    assert adapters.LinuxAdapter._activity_state() == "active"
+    assert len(called_x11_screensaver) == 0  # should not fall through when extension works
+
+
+def test_linux_activity_state_falls_back_to_x11_screensaver_when_extension_unavailable(monkeypatch):
+    monkeypatch.setattr(adapters.LinuxAdapter, "_gnome_extension_idle", lambda: None)
+    monkeypatch.setattr(adapters.LinuxAdapter, "_x11_screensaver_idle", lambda: 301_000)
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: None)
+
+    assert adapters.LinuxAdapter._activity_state() == "idle"

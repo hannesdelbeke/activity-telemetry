@@ -31,20 +31,54 @@ class GenericAdapter(Adapter):
 
 class LinuxAdapter(Adapter):
     def snapshot(self) -> Snapshot:
-        app = self._x11_app()
-        if shutil.which("xdotool"):
-            try:
-                window = subprocess.check_output(
-                    ["xdotool", "getactivewindow", "getwindowclassname"],
-                    text=True,
-                    stderr=subprocess.DEVNULL,
-                    timeout=2,
-                ).strip()
-                if window:
-                    app = window[:128]
-            except (OSError, subprocess.SubprocessError):
-                pass
+        # On Wayland, the GNOME extension is the only source that works.
+        # On X11, it is absent and the existing X11 mechanisms run instead.
+        app = self._gnome_extension_app()
+        if not app or app == "unknown":
+            app = self._x11_app()
+            if shutil.which("xdotool"):
+                try:
+                    window = subprocess.check_output(
+                        ["xdotool", "getactivewindow", "getwindowclassname"],
+                        text=True,
+                        stderr=subprocess.DEVNULL,
+                        timeout=2,
+                    ).strip()
+                    if window:
+                        app = window[:128]
+                except (OSError, subprocess.SubprocessError):
+                    pass
         return Snapshot(app, self._activity_state())
+
+    @staticmethod
+    def _gnome_extension_app() -> str:
+        """Read the focused app from the GNOME Shell extension, or unknown if unavailable."""
+        if not shutil.which("gdbus"):
+            return "unknown"
+        try:
+            output = subprocess.check_output(
+                [
+                    "gdbus",
+                    "call",
+                    "--session",
+                    "--dest=org.activitycollector.Telemetry",
+                    "--object-path=/org/activitycollector/Telemetry",
+                    "--method=org.activitycollector.Telemetry.GetFocusedApp",
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            ).strip()
+            # gdbus prints the return value as a GVariant tuple, e.g. ('AppName',)
+            # Extract the quoted string value.
+            match = re.search(r"\('([^']*)'\s*,?\s*\)", output)
+            if match:
+                app = match.group(1)
+                # truncate to 128 chars and never return empty string
+                return app[:128] or "unknown"
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+        return "unknown"
 
     @staticmethod
     def _x11_app() -> str:
@@ -72,7 +106,13 @@ class LinuxAdapter(Adapter):
 
     @staticmethod
     def _activity_state() -> str:
-        # Try X11 via XScreenSaver extension first.
+        # On Wayland, the GNOME extension is the only source that works.
+        # On X11, it is absent and the existing mechanisms run instead.
+        idle_ms = LinuxAdapter._gnome_extension_idle()
+        if idle_ms is not None:
+            return "idle" if idle_ms >= IDLE_AFTER_SECONDS * 1000 else "active"
+
+        # Try X11 via XScreenSaver extension.
         idle_ms = LinuxAdapter._x11_screensaver_idle()
         if idle_ms is not None:
             return "idle" if idle_ms >= IDLE_AFTER_SECONDS * 1000 else "active"
@@ -118,6 +158,36 @@ class LinuxAdapter(Adapter):
                 pass
 
         return "active"
+
+    @staticmethod
+    def _gnome_extension_idle() -> int | None:
+        """Return idle milliseconds from the GNOME Shell extension, or None if unavailable."""
+        if not shutil.which("gdbus"):
+            return None
+        try:
+            output = subprocess.check_output(
+                [
+                    "gdbus",
+                    "call",
+                    "--session",
+                    "--dest=org.activitycollector.Telemetry",
+                    "--object-path=/org/activitycollector/Telemetry",
+                    "--method=org.activitycollector.Telemetry.GetIdletime",
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            ).strip()
+            # gdbus prints the return tuple as GVariant, '(uint64 12345,)'.
+            # Match just the scalar, tolerant of spacing.
+            match = re.search(r"uint64\s+(\d+)", output)
+            if match:
+                idle_ms = int(match.group(1))
+                # 0 means no idle information available; treat as None so we fall through
+                return idle_ms if idle_ms > 0 else None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+        return None
 
     @staticmethod
     def _x11_screensaver_idle() -> int | None:
