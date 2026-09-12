@@ -47,6 +47,21 @@ python -m activity_collector
 The default collector is intentionally dry-run/local-only until an ingest URL
 and write token are configured.
 
+### Linux user service
+
+Copy `systemd/activity-collector.service` to
+`~/.config/systemd/user/`, create `~/.config/activity-collector/env` with a
+generic `ACTIVITY_MACHINE_ID`, then run:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now activity-collector.service
+```
+
+The service starts when the graphical user session starts and writes to the
+local SQLite spool. It does not upload anything unless both
+`ACTIVITY_INGEST_URL` and `ACTIVITY_WRITE_TOKEN` are configured.
+
 ## Event contract
 
 ```json

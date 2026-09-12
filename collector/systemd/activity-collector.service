@@ -1,0 +1,17 @@
+[Unit]
+Description=Local privacy-preserving activity collector
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/repos/activity-telemetry/collector
+Environment=PYTHONPATH=%h/repos/activity-telemetry/collector/src
+EnvironmentFile=-%h/.config/activity-collector/env
+ExecStart=/usr/bin/python3 -m activity_collector
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
