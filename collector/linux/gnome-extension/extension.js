@@ -76,23 +76,26 @@ export default class ActivityCollectorExtension extends Extension {
     }
 
     GetIdletime() {
-        try {
-            const backend = global.backend;
-            if (!backend) {
-                return 0;
-            }
-
-            const monitor = backend.get_core_idle_monitor();
-            if (!monitor) {
-                return 0;
-            }
-
-            const idletime = monitor.get_idletime();
-            // idletime is already in milliseconds, return as uint64
-            return idletime;
-        } catch (e) {
-            // return 0 when idle information is unavailable
-            return 0;
+        // Throw rather than return 0 when the monitor is unavailable. 0 is a
+        // real answer -- it is what get_idletime() reports the instant after a
+        // keypress -- so returning it for "I cannot tell" makes the two
+        // indistinguishable to the caller. The collector read that 0 as "no
+        // information", fell through every remaining probe, and ended up
+        // defaulting to active, so a shell without a core idle monitor reported
+        // a machine as busy all night. A thrown error becomes a D-Bus error
+        // reply, gdbus exits non-zero, and the collector can tell the
+        // difference.
+        const backend = global.backend;
+        if (!backend) {
+            throw new Error('no backend: idle time is unavailable');
         }
+
+        const monitor = backend.get_core_idle_monitor();
+        if (!monitor) {
+            throw new Error('no core idle monitor: idle time is unavailable');
+        }
+
+        // Already in milliseconds.
+        return monitor.get_idletime();
     }
 }

@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -48,7 +49,42 @@ def _flush(spool: Spool, ingest_url: str, token: str, retention_days: int) -> No
     spool.prune_synced(retention_days)
 
 
+def diagnose() -> int:
+    """Print one snapshot and say which idle probe produced it.
+
+    Exists because the failure mode this collector is most prone to is silent:
+    when every idle probe declines, the result looks exactly like a probe that
+    answered, and the only symptom is a machine that is never idle. Reading the
+    spool cannot tell you which -- you have to ask the adapter what spoke.
+
+    Returns a shell exit code: non-zero when no probe could measure idle time, so
+    this is usable as a check and not only as something to read.
+    """
+    adapter = create_adapter()
+    snapshot = adapter.snapshot()
+    source, idle_ms = getattr(adapter, "idle_reading", lambda: ("n/a", None))()
+
+    print(f"adapter       {type(adapter).__name__}")
+    print(f"app           {snapshot.app}")
+    print(f"activity      {snapshot.activity_state}")
+    print(f"idle source   {source}")
+    print(f"idle ms       {idle_ms if idle_ms is not None else '-'}")
+
+    if snapshot.activity_state == "unknown":
+        print(
+            "\nNo idle probe answered, so activity is reported as unknown rather\n"
+            "than guessed. On GNOME Wayland this usually means the shell extension\n"
+            "is not enabled: check `gnome-extensions list --enabled` for\n"
+            "activity-collector@local, and see AGENTS.md."
+        )
+        return 1
+    return 0
+
+
 def main() -> None:
+    if "--diagnose" in sys.argv[1:]:
+        raise SystemExit(diagnose())
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     machine_id = os.environ.get("ACTIVITY_MACHINE_ID")

@@ -154,59 +154,88 @@ class LinuxAdapter(Adapter):
         return (values[-1] if values else "unknown")[:128] or "unknown"
 
     @staticmethod
+    def idle_reading() -> tuple[str, int | None]:
+        """Which source answered, and the idle milliseconds it gave.
+
+        Ordered best first. The GNOME extension is the only source that works on
+        Wayland; on X11 it is absent and the X11 mechanisms run instead. Mutter's
+        own IdleMonitor is last because on a locked or remote session it is often
+        present but refuses the call.
+
+        The source name is returned alongside the number because the failure this
+        function exists to make visible is silent: every probe declining looks
+        exactly like a probe answering, unless you can see which one spoke.
+        """
+        probes = (
+            ("gnome-extension", LinuxAdapter._gnome_extension_idle),
+            ("x11-screensaver", LinuxAdapter._x11_screensaver_idle),
+            ("xprintidle", LinuxAdapter._xprintidle_idle),
+            ("mutter-idlemonitor", LinuxAdapter._mutter_idle),
+        )
+        for name, probe in probes:
+            idle_ms = probe()
+            if idle_ms is not None:
+                return name, idle_ms
+        return "none", None
+
+    @staticmethod
     def _activity_state() -> str:
-        # On Wayland, the GNOME extension is the only source that works.
-        # On X11, it is absent and the existing mechanisms run instead.
-        idle_ms = LinuxAdapter._gnome_extension_idle()
-        if idle_ms is not None:
-            return "idle" if idle_ms >= IDLE_AFTER_SECONDS * 1000 else "active"
+        _, idle_ms = LinuxAdapter.idle_reading()
+        if idle_ms is None:
+            # Nothing could measure idle time, so nothing is known. This used to
+            # return "active", which is a confident lie in the one direction that
+            # destroys the data: walking away from a machine whose probes all
+            # decline produced an unbroken active day. On a live Wayland box that
+            # was every single sample -- 323 of them, none ever idle.
+            #
+            # "unknown" is honest, and the sink already renders it as neither
+            # active nor idle, so a broken probe now shows up as a gap in the
+            # timeline instead of as work that never happened.
+            return "unknown"
+        return "idle" if idle_ms >= IDLE_AFTER_SECONDS * 1000 else "active"
 
-        # Try X11 via XScreenSaver extension.
-        idle_ms = LinuxAdapter._x11_screensaver_idle()
-        if idle_ms is not None:
-            return "idle" if idle_ms >= IDLE_AFTER_SECONDS * 1000 else "active"
+    @staticmethod
+    def _xprintidle_idle() -> int | None:
+        """Return idle milliseconds from xprintidle, or None if unavailable."""
+        if not shutil.which("xprintidle"):
+            return None
+        try:
+            output = subprocess.check_output(
+                ["xprintidle"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            ).strip()
+            return int(output)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
 
-        # Fall back to xprintidle if available.
-        if shutil.which("xprintidle"):
-            try:
-                output = subprocess.check_output(
-                    ["xprintidle"],
-                    text=True,
-                    stderr=subprocess.DEVNULL,
-                    timeout=2,
-                ).strip()
-                idle_ms = int(output)
-                return "idle" if idle_ms >= IDLE_AFTER_SECONDS * 1000 else "active"
-            except (OSError, subprocess.SubprocessError, ValueError):
-                pass
-
-        # Best-effort Wayland via GNOME Mutter IdleMonitor.
-        if shutil.which("gdbus"):
-            try:
-                output = subprocess.check_output(
-                    [
-                        "gdbus",
-                        "call",
-                        "--session",
-                        "--dest=org.gnome.Mutter.IdleMonitor",
-                        "--object-path=/org/gnome/Mutter/IdleMonitor/Core",
-                        "--method=org.gnome.Mutter.IdleMonitor.GetIdletime",
-                    ],
-                    text=True,
-                    stderr=subprocess.DEVNULL,
-                    timeout=2,
-                ).strip()
-                # gdbus prints the return tuple as GVariant, '(uint64 12345,)'.
-                # Match just the scalar, so spacing or a future extra member in
-                # the tuple does not silently turn idle detection off.
-                match = re.search(r"uint64\s+(\d+)", output)
-                if match:
-                    idle_ms = int(match.group(1))
-                    return "idle" if idle_ms >= IDLE_AFTER_SECONDS * 1000 else "active"
-            except (OSError, subprocess.SubprocessError, ValueError):
-                pass
-
-        return "active"
+    @staticmethod
+    def _mutter_idle() -> int | None:
+        """Return idle milliseconds from GNOME Mutter's IdleMonitor, or None."""
+        if not shutil.which("gdbus"):
+            return None
+        try:
+            output = subprocess.check_output(
+                [
+                    "gdbus",
+                    "call",
+                    "--session",
+                    "--dest=org.gnome.Mutter.IdleMonitor",
+                    "--object-path=/org/gnome/Mutter/IdleMonitor/Core",
+                    "--method=org.gnome.Mutter.IdleMonitor.GetIdletime",
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            ).strip()
+            # gdbus prints the return tuple as GVariant, '(uint64 12345,)'.
+            # Match just the scalar, so spacing or a future extra member in
+            # the tuple does not silently turn idle detection off.
+            match = re.search(r"uint64\s+(\d+)", output)
+            return int(match.group(1)) if match else None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
 
     @staticmethod
     def _gnome_extension_idle() -> int | None:
@@ -231,9 +260,13 @@ class LinuxAdapter(Adapter):
             # Match just the scalar, tolerant of spacing.
             match = re.search(r"uint64\s+(\d+)", output)
             if match:
-                idle_ms = int(match.group(1))
-                # 0 means no idle information available; treat as None so we fall through
-                return idle_ms if idle_ms > 0 else None
+                # 0 is a real reading -- it is what the monitor reports the
+                # instant after a keypress. It used to be treated as "no
+                # information" and fall through, because the extension returned
+                # 0 for both. The extension now raises a D-Bus error when it
+                # cannot tell, which gdbus turns into a non-zero exit and the
+                # except below into None, so the two cases are finally distinct.
+                return int(match.group(1))
         except (OSError, subprocess.SubprocessError, ValueError):
             pass
         return None

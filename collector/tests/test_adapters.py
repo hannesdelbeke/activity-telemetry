@@ -84,10 +84,12 @@ def test_linux_activity_state_falls_back_to_gdbus_for_wayland(monkeypatch):
     assert adapters.LinuxAdapter._activity_state() == "idle"
 
 
-def test_linux_activity_state_defaults_to_active_when_no_mechanism_available(monkeypatch):
+def test_linux_activity_state_is_unknown_when_no_mechanism_available(monkeypatch):
+    # Not "active". Walking away from a machine whose probes all decline is the
+    # exact case this reports, and calling it active fabricates a working day.
     monkeypatch.setattr(adapters.LinuxAdapter, "_x11_screensaver_idle", lambda: None)
     monkeypatch.setattr(adapters.shutil, "which", lambda cmd: None)
-    assert adapters.LinuxAdapter._activity_state() == "active"
+    assert adapters.LinuxAdapter._activity_state() == "unknown"
 
 
 def test_linux_activity_state_survives_xprintidle_failure(monkeypatch):
@@ -98,7 +100,7 @@ def test_linux_activity_state_survives_xprintidle_failure(monkeypatch):
         raise FileNotFoundError("xprintidle")
 
     monkeypatch.setattr(subprocess, "check_output", explode)
-    assert adapters.LinuxAdapter._activity_state() == "active"
+    assert adapters.LinuxAdapter._activity_state() == "unknown"
 
 
 def test_linux_activity_state_survives_gdbus_failure(monkeypatch):
@@ -110,7 +112,37 @@ def test_linux_activity_state_survives_gdbus_failure(monkeypatch):
         raise subprocess.SubprocessError("gdbus failed")
 
     monkeypatch.setattr(subprocess, "check_output", explode)
+    assert adapters.LinuxAdapter._activity_state() == "unknown"
+
+
+def test_linux_a_zero_idle_reading_means_active_not_unknown(monkeypatch):
+    # The instant after a keypress the monitor reports 0ms idle. That has to
+    # reach the threshold comparison, not be mistaken for a probe declining --
+    # otherwise the one moment you are provably at the keyboard reads as unknown.
+    monkeypatch.setattr(adapters.LinuxAdapter, "_gnome_extension_idle", lambda: 0)
     assert adapters.LinuxAdapter._activity_state() == "active"
+
+
+def test_linux_idle_reading_names_the_source_that_answered(monkeypatch):
+    monkeypatch.setattr(adapters.LinuxAdapter, "_gnome_extension_idle", lambda: None)
+    monkeypatch.setattr(adapters.LinuxAdapter, "_x11_screensaver_idle", lambda: None)
+    monkeypatch.setattr(adapters.LinuxAdapter, "_xprintidle_idle", lambda: 7_000)
+    monkeypatch.setattr(adapters.LinuxAdapter, "_mutter_idle", lambda: 9_999)
+    assert adapters.LinuxAdapter.idle_reading() == ("xprintidle", 7_000)
+
+
+def test_linux_idle_reading_says_none_when_every_probe_declines(monkeypatch):
+    for probe in ("_gnome_extension_idle", "_x11_screensaver_idle", "_xprintidle_idle", "_mutter_idle"):
+        monkeypatch.setattr(adapters.LinuxAdapter, probe, lambda: None)
+    assert adapters.LinuxAdapter.idle_reading() == ("none", None)
+
+
+def test_linux_idle_reading_prefers_the_extension_over_every_later_probe(monkeypatch):
+    monkeypatch.setattr(adapters.LinuxAdapter, "_gnome_extension_idle", lambda: 1_000)
+    monkeypatch.setattr(adapters.LinuxAdapter, "_x11_screensaver_idle", lambda: 2_000)
+    monkeypatch.setattr(adapters.LinuxAdapter, "_xprintidle_idle", lambda: 3_000)
+    monkeypatch.setattr(adapters.LinuxAdapter, "_mutter_idle", lambda: 4_000)
+    assert adapters.LinuxAdapter.idle_reading() == ("gnome-extension", 1_000)
 
 
 def test_linux_x11_screensaver_idle_returns_none_when_libraries_missing(monkeypatch):
@@ -317,10 +349,22 @@ def test_linux_gnome_extension_idle_returns_milliseconds(monkeypatch):
     assert adapters.LinuxAdapter._gnome_extension_idle() == 42000
 
 
-def test_linux_gnome_extension_idle_treats_zero_as_unavailable(monkeypatch):
+def test_linux_gnome_extension_idle_takes_zero_at_face_value(monkeypatch):
     monkeypatch.setattr(adapters.shutil, "which", lambda cmd: cmd == "gdbus" and "/usr/bin/gdbus")
     monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: "(uint64 0,)\n")
-    # 0 means no idle information, should return None to fall through
+    # 0 is what the monitor reports the instant after a keypress. The extension
+    # signals "cannot tell" by raising, which gdbus turns into a non-zero exit,
+    # so this path no longer has to overload 0 to mean both.
+    assert adapters.LinuxAdapter._gnome_extension_idle() == 0
+
+
+def test_linux_gnome_extension_idle_is_none_when_the_extension_raises(monkeypatch):
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: cmd == "gdbus" and "/usr/bin/gdbus")
+
+    def gdbus_error(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(1, "gdbus", stderr="GDBus.Error:...: no core idle monitor")
+
+    monkeypatch.setattr(subprocess, "check_output", gdbus_error)
     assert adapters.LinuxAdapter._gnome_extension_idle() is None
 
 

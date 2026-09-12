@@ -75,3 +75,21 @@ def test_the_extension_gives_up_its_bus_name_when_disabled():
     assert len(body) == 2, "no disable() in the extension"
     assert "bus_unown_name" in body[1]
     assert "unexport" in body[1]
+
+
+def test_getidletime_raises_rather_than_returning_zero_when_it_cannot_tell():
+    """0ms idle is a real reading, so it must not double as "unavailable".
+
+    This is the bug that made a machine look busy all night: the extension
+    returned 0 when there was no core idle monitor, the collector read 0 as "no
+    information", fell through every remaining probe and defaulted to active.
+    A thrown error becomes a D-Bus error reply, which gdbus reports as a
+    non-zero exit, which the collector can actually distinguish.
+    """
+    source = SOURCE.read_text(encoding="utf-8")
+    body = source[source.index("GetIdletime()") :]
+    # Comments are stripped first, or a comment explaining why 0 is wrong would
+    # itself fail the check below.
+    code = "\n".join(line for line in body.splitlines() if not line.strip().startswith("//"))
+    assert "throw new Error" in code, "GetIdletime must signal unavailability by throwing"
+    assert "return 0" not in code, "returning 0 makes 'no idle monitor' look like 'just typed'"
