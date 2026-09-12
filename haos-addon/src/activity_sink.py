@@ -14,7 +14,7 @@ MAX_BODY = 256 * 1024
 MAX_EVENTS = 100
 DB_PATH = Path(os.environ.get("ACTIVITY_DB", "/data/activity.db"))
 def _option(name: str) -> str | None:
-    value = os.environ.get(name)
+    value = os.environ.get("ACTIVITY_WRITE_TOKEN") if name == "write_token" else os.environ.get(name)
     if value:
         return value
     try:
