@@ -31,6 +31,11 @@ class GenericAdapter(Adapter):
 
 class LinuxAdapter(Adapter):
     def snapshot(self) -> Snapshot:
+        # A locked screen is checked first, because it is the one state where
+        # every other source gives a confidently wrong answer.
+        if self._screen_locked():
+            return Snapshot("locked", "idle")
+
         # On Wayland, the GNOME extension is the only source that works.
         # On X11, it is absent and the existing X11 mechanisms run instead.
         app = self._gnome_extension_app()
@@ -49,6 +54,50 @@ class LinuxAdapter(Adapter):
                 except (OSError, subprocess.SubprocessError):
                     pass
         return Snapshot(app, self._activity_state())
+
+    @staticmethod
+    def _screen_locked() -> bool:
+        """True when the GNOME session is locked.
+
+        GNOME disables extensions on the lock screen, so this extension's bus
+        name vanishes at exactly the moment the screen locks. The adapter then
+        falls through to the X11 tiers, which on native Wayland answer
+        "unknown" -- so locking the machine looked identical to a Wayland
+        session where the extension had never been installed.
+
+        The state was wrong too, and in the direction that matters. Locking
+        resets the idle timer, so for the first IDLE_AFTER_SECONDS of an
+        overnight lock the machine reported `unknown`/`active`: five minutes of
+        apparent work, every night, at a keyboard nobody was sitting at.
+
+        org.gnome.ScreenSaver is owned by gnome-shell itself rather than by the
+        extension, so unlike the extension it survives the lock. Anything else
+        -- not GNOME, no gdbus, call fails -- answers False and the ordinary
+        path runs, because a wrong "locked" would erase real activity.
+        """
+        if not shutil.which("gdbus"):
+            return False
+        try:
+            output = subprocess.check_output(
+                [
+                    "gdbus",
+                    "call",
+                    "--session",
+                    "--dest=org.gnome.ScreenSaver",
+                    "--object-path=/org/gnome/ScreenSaver",
+                    "--method=org.gnome.ScreenSaver.GetActive",
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        # The reply is the GVariant tuple '(true,)' or '(false,)', and nothing
+        # else counts. A substring search for "true" would also match "untrue"
+        # and any diagnostic text that happens to contain the word, and the
+        # cost of a false positive here is erasing real activity.
+        return re.fullmatch(r"\s*\(\s*true\s*,\s*\)\s*", output) is not None
 
     @staticmethod
     def _gnome_extension_app() -> str:

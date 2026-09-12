@@ -406,3 +406,60 @@ def test_linux_activity_state_falls_back_to_x11_screensaver_when_extension_unava
     monkeypatch.setattr(adapters.shutil, "which", lambda cmd: None)
 
     assert adapters.LinuxAdapter._activity_state() == "idle"
+
+
+def _locked_gdbus(monkeypatch, reply: str):
+    """gdbus present, org.gnome.ScreenSaver answering `reply`."""
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: reply)
+
+
+def test_a_locked_screen_reports_locked_and_idle(monkeypatch):
+    """The bug this exists for: locking is not five minutes of work.
+
+    GNOME disables extensions on the lock screen, so the focused-app source
+    disappears precisely when the screen locks, and locking also resets the
+    idle timer. Without this check the collector recorded `unknown`/`active`
+    for the first IDLE_AFTER_SECONDS of every lock.
+    """
+    _locked_gdbus(monkeypatch, "(true,)")
+    snapshot = adapters.LinuxAdapter().snapshot()
+    assert (snapshot.app, snapshot.activity_state) == ("locked", "idle")
+
+
+def test_an_unlocked_screen_is_left_to_the_ordinary_path(monkeypatch):
+    _locked_gdbus(monkeypatch, "(false,)")
+    monkeypatch.setattr(adapters.LinuxAdapter, "_gnome_extension_app", staticmethod(lambda: "org.gnome.Terminal"))
+    monkeypatch.setattr(adapters.LinuxAdapter, "_activity_state", staticmethod(lambda: "active"))
+    snapshot = adapters.LinuxAdapter().snapshot()
+    assert (snapshot.app, snapshot.activity_state) == ("org.gnome.Terminal", "active")
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "(false,)",
+        "",
+        "not a variant",
+        "falsey",
+        # Contains "true" but does not say true. A substring test passes this
+        # and reports the machine as locked.
+        "(untrue,)",
+        "Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: true",
+    ],
+)
+def test_only_a_true_reply_counts_as_locked(monkeypatch, reply):
+    # A wrong "locked" erases real activity, so anything unrecognised is not it.
+    _locked_gdbus(monkeypatch, reply)
+    assert adapters.LinuxAdapter._screen_locked() is False
+
+
+def test_a_screensaver_that_is_not_there_is_not_a_lock(monkeypatch):
+    # No GNOME, no gdbus, or the call raising: all mean "cannot tell", and
+    # cannot-tell must not be reported as locked.
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: None)
+    assert adapters.LinuxAdapter._screen_locked() is False
+
+    monkeypatch.setattr(adapters.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    monkeypatch.setattr(subprocess, "check_output", _raise_oserror)
+    assert adapters.LinuxAdapter._screen_locked() is False
