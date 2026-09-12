@@ -1,0 +1,20 @@
+name: Activity Sink
+version: "0.1.0"
+slug: activity_sink
+description: Append-only local activity event sink
+startup: services
+boot: auto
+init: false
+arch:
+  - amd64
+  - aarch64
+ports:
+  8788/tcp: 8788
+ports_description:
+  8788/tcp: Activity ingest API
+map:
+  - data:rw
+options:
+  write_token: ""
+schema:
+  write_token: str
