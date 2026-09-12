@@ -244,6 +244,38 @@ def test_a_bar_is_clipped_at_midnight_rather_than_overhanging_the_track() -> Non
         assert bar["left"] + bar["width"] <= 100.0 + 1e-9
 
 
+def test_touching_bars_of_one_state_become_a_single_run() -> None:
+    from datetime import date
+
+    steady = [_sample(minute, "chrome") for minute in range(11)]
+    (_, bars), = activity_sink._segments(steady, date(2026, 1, 1))
+    # Ten charged minute-long bars, one run. Unmerged these are a quarter of a
+    # pixel each and render as a smear rather than a band.
+    assert len(bars) == 1
+    assert bars[0]["seconds"] == pytest.approx(10 * 60)
+
+
+def test_a_change_of_state_breaks_the_run() -> None:
+    from datetime import date
+
+    samples = [_sample(m, "chrome", "active") for m in range(3)]
+    samples += [_sample(m, "chrome", "idle") for m in range(3, 6)]
+    (_, bars), = activity_sink._segments(samples, date(2026, 1, 1))
+    assert [bar["state"] for bar in bars] == ["active", "idle"]
+
+
+def test_an_outage_stays_a_hole_instead_of_being_merged_over() -> None:
+    """The gap is the point. Merging across it paints an absence as presence."""
+    from datetime import date
+
+    samples = [_sample(0, "chrome"), _sample(1, "chrome"), _sample(600, "chrome"), _sample(601, "chrome")]
+    (_, bars), = activity_sink._segments(samples, date(2026, 1, 1))
+    assert len(bars) > 1
+    # Every run ends before the next begins; none spans the ten hour outage.
+    for earlier, later in zip(bars, bars[1:]):
+        assert earlier["left"] + earlier["width"] < later["left"]
+
+
 def test_an_empty_day_draws_no_tracks() -> None:
     from datetime import date
 
@@ -290,6 +322,80 @@ def test_a_machine_name_with_an_ampersand_stays_one_parameter(panel, server) -> 
 
     body = _get(panel + "/")[1].decode()
     assert "machine=a%26b" in body
+
+
+def _forget_request(url: str, machine: str) -> int:
+    import urllib.parse
+
+    body = urllib.parse.urlencode({"forget": machine}).encode()
+    request = urllib.request.Request(url + "/", data=body, method="POST")
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args):  # the 303 is the success signal
+            return None
+
+    opener = urllib.request.build_opener(NoRedirect)
+    try:
+        with opener.open(request, timeout=5) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        return error.code
+
+
+def _stored(machine: str) -> int:
+    import sqlite3
+
+    db = sqlite3.connect(activity_sink.DB_PATH)
+    try:
+        return db.execute("SELECT COUNT(*) FROM events WHERE machine_id = ?", (machine,)).fetchone()[0]
+    finally:
+        db.close()
+
+
+def test_forgetting_a_machine_removes_only_that_machines_events(panel, server) -> None:
+    now = activity_sink.datetime.now(activity_sink.timezone.utc).isoformat()
+    for index, machine in enumerate(["keep-me", "smoke-test", "smoke-test"]):
+        event = _event(event_id=f"f{index}", machine_id=machine, occurred_at=now)
+        assert _post(server, json.dumps({"events": [event]}).encode()) == 202
+
+    assert _stored("smoke-test") == 2
+    assert _forget_request(panel, "smoke-test") == 303
+    assert _stored("smoke-test") == 0
+    assert _stored("keep-me") == 1
+
+
+def test_forgetting_needs_a_post_so_a_prefetch_cannot_delete(panel, server) -> None:
+    event = _event(event_id="prefetch", machine_id="safe")
+    event["occurred_at"] = activity_sink.datetime.now(activity_sink.timezone.utc).isoformat()
+    assert _post(server, json.dumps({"events": [event]}).encode()) == 202
+
+    # A GET carrying the same parameter must render a page, never delete.
+    assert _get(panel + "/?forget=safe")[0] == 200
+    assert _stored("safe") == 1
+
+
+def test_the_ingest_port_cannot_delete_anything(server) -> None:
+    """A leaked device write token adds events. It must never remove them."""
+    event = _event(event_id="ingest-delete", machine_id="safe2")
+    event["occurred_at"] = activity_sink.datetime.now(activity_sink.timezone.utc).isoformat()
+    assert _post(server, json.dumps({"events": [event]}).encode()) == 202
+
+    assert _forget_request(server, "safe2") in (401, 404)
+    assert _stored("safe2") == 1
+
+
+def test_a_forget_with_no_machine_is_rejected(panel) -> None:
+    assert _forget_request(panel, "") == 400
+
+
+def test_the_timeline_offers_a_forget_button_per_machine(panel, server) -> None:
+    event = _event(event_id="btn", machine_id="m-btn")
+    event["occurred_at"] = activity_sink.datetime.now(activity_sink.timezone.utc).isoformat()
+    assert _post(server, json.dumps({"events": [event]}).encode()) == 202
+
+    body = _get(panel + "/?view=timeline")[1].decode()
+    assert 'name="forget" value="m-btn"' in body
+    assert 'method="post"' in body
 
 
 def test_the_json_endpoint_returns_the_days_events(panel, server) -> None:

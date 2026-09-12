@@ -151,6 +151,18 @@ def _cap(gaps: list[float]) -> float:
     return min(900.0, max(60.0, 3 * statistics.median(gaps))) if gaps else 60.0
 
 
+def _forget(machine: str) -> int:
+    """Delete every event from one machine. Returns how many rows went.
+
+    The only destructive operation in the service, and it is deliberately not
+    reachable from the ingest port: a leaked device write token can add events,
+    never remove anyone's. It lives on the Ingress side, which Home Assistant
+    authenticates and config.yaml never publishes to the LAN.
+    """
+    with _database() as db:
+        return db.execute("DELETE FROM events WHERE machine_id = ?", (machine,)).rowcount
+
+
 def _summarise(events: list[dict]) -> dict:
     """Turn point samples into durations by charging each sample the gap to the next.
 
@@ -215,13 +227,39 @@ def _segments(events: list[dict], day: date) -> list[tuple[str, list[dict]]]:
                     "left": left,
                     "width": min(width, 100.0 - left),
                     "at": sample["at"],
-                    "app": sample["app"],
+                    "until": sample["at"] + timedelta(seconds=charged),
                     "state": sample["activity_state"],
                     "seconds": charged,
                 }
             )
-        timeline.append((machine, bars))
+        timeline.append((machine, _merge(bars)))
     return timeline
+
+
+def _merge(bars: list[dict]) -> list[dict]:
+    """Fuse touching bars that share a state into one run.
+
+    At a 30 second sample interval a single bar is 0.035% of the day, which is
+    a quarter of a pixel on a 700px track. Drawn separately, several hundred of
+    them antialias into a grey smear instead of a solid band, and the rounded
+    corners put a seam between every pair. Merged, a morning at the desk is one
+    rectangle.
+
+    Only touching bars merge, so a gap the cap refused to charge stays a gap --
+    that hole is the whole point of capping, and closing it here would paint
+    over an outage exactly as if the machine had been busy through it.
+    """
+    runs: list[dict] = []
+    for bar in bars:
+        last = runs[-1] if runs else None
+        touching = last is not None and abs(last["left"] + last["width"] - bar["left"]) < 1e-9
+        if last is not None and touching and last["state"] == bar["state"]:
+            last["width"] += bar["width"]
+            last["until"] = bar["until"]
+            last["seconds"] += bar["seconds"]
+        else:
+            runs.append(dict(bar))
+    return runs
 
 
 def _link(keep: dict, **params: object) -> str:
@@ -331,11 +369,22 @@ def _timeline_page(day: date, machine: str | None, timeline: list, machines: lis
             # rather than interpolated: activity_state arrives from a client and
             # anything client-controlled inside an attribute is an injection.
             f'<i class="{"active" if bar["state"] == "active" else "idle" if bar["state"] == "idle" else "other"}"'
-            f' style="left:{bar["left"]:.4f}%;width:{bar["width"]:.4f}%"'
-            f' title="{html.escape(f"{bar['at']:%H:%M} {bar['app']} ({bar['state']}, {_duration(bar['seconds'])})")}"></i>'
+            f' style="left:{bar["left"]:.4f}%;width:{max(bar["width"], 0.12):.4f}%"'
+            f' title="{html.escape(f"{bar['at']:%H:%M}-{bar['until']:%H:%M} {bar['state']} ({_duration(bar['seconds'])})")}"></i>'
             for bar in bars
         )
-        rows += f'<div class="lab">{html.escape(name)}</div><div class="track">{drawn}</div>'
+        # The forget button is a POST, so a link prefetcher or a crawler
+        # following hrefs cannot delete anybody's history by accident.
+        forget = (
+            f'<form method="post" onsubmit="return confirm(\'Forget all events from '
+            f'{html.escape(name, quote=True)}? This cannot be undone.\')">'
+            f'<input type="hidden" name="forget" value="{html.escape(name, quote=True)}">'
+            f'<button title="Forget this machine">&times;</button></form>'
+        )
+        rows += (
+            f'<div class="lab"><span>{html.escape(name)}</span>{forget}</div>'
+            f'<div class="track">{drawn}</div>'
+        )
 
     if not rows:
         rows = '<div class="lab"></div><div class="empty">No events for this day.</div>'
@@ -357,12 +406,21 @@ def _timeline_page(day: date, machine: str | None, timeline: list, machines: lis
  .axis {{ position: relative; height: 1.1rem; font-size: .72rem; opacity: .6; font-variant-numeric: tabular-nums; }}
  .axis span {{ position: absolute; transform: translateX(-50%); }}
  .axis span:first-child {{ transform: none; }}
- .lab {{ text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .8; }}
+ .lab {{ display: flex; align-items: center; justify-content: flex-end; gap: .4rem;
+   overflow: hidden; white-space: nowrap; opacity: .8; }}
+ .lab span {{ overflow: hidden; text-overflow: ellipsis; }}
+ .lab form {{ margin: 0; }}
+ .lab button {{ background: none; border: 0; color: inherit; cursor: pointer; opacity: 0;
+   font-size: 1rem; line-height: 1; padding: 0 .15rem; }}
+ .lab:hover button {{ opacity: .5; }}
+ .lab button:hover {{ opacity: 1; }}
  .track {{ position: relative; height: 1.5rem; border-radius: .25rem;
    background: repeating-linear-gradient(to right,
      color-mix(in srgb, currentColor 9%, transparent) 0 1px,
      color-mix(in srgb, currentColor 4%, transparent) 1px 12.5%); }}
- .track i {{ position: absolute; top: 0; height: 100%; border-radius: .15rem; background: currentColor; }}
+ /* No border-radius: runs sit edge to edge, and rounding each end would put a
+    visible notch between every pair of adjacent runs. */
+ .track i {{ position: absolute; top: 0; height: 100%; background: currentColor; }}
  .track i.active {{ opacity: .62; }}
  .track i.idle {{ opacity: .22; }}
  .track i.other {{ opacity: .22; }}
@@ -393,7 +451,7 @@ class ReadHandler(BaseHTTPRequestHandler):
     device write token still cannot read anybody's history back out.
     """
 
-    server_version = "activity-sink/0.3"
+    server_version = "activity-sink/0.3.1"
 
     def log_message(self, fmt: str, *args: object) -> None:
         logging.debug("ingress %s", fmt % args)
@@ -435,6 +493,35 @@ class ReadHandler(BaseHTTPRequestHandler):
             body = _page(day, machine, summary, events[-12:][::-1])
         self._send(200, body, "text/html; charset=utf-8")
 
+    def do_POST(self) -> None:
+        """Forget one machine. The only write the panel can make."""
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > 4096:
+            self._send(400, b"bad request", "text/plain; charset=utf-8")
+            return
+
+        form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+        machine = (form.get("forget") or [""])[0]
+        if not machine:
+            self._send(400, b"bad request", "text/plain; charset=utf-8")
+            return
+
+        try:
+            deleted = _forget(machine)
+        except sqlite3.Error:
+            logging.exception("could not delete from %s", DB_PATH)
+            self._send(503, b"storage unavailable", "text/plain; charset=utf-8")
+            return
+
+        logging.info("forgot %s (%d events)", machine, deleted)
+        # See-other back to the timeline, so a refresh does not re-post. The
+        # Location is relative because Ingress mounts this under a generated
+        # prefix that the add-on never learns.
+        self.send_response(303)
+        self.send_header("Location", "?view=timeline")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _send(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -444,7 +531,7 @@ class ReadHandler(BaseHTTPRequestHandler):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "activity-sink/0.3"
+    server_version = "activity-sink/0.3.1"
 
     def _respond(self, status: int, payload: dict) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode()
