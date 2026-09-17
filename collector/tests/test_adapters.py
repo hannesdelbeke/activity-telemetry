@@ -34,7 +34,11 @@ def test_front_app_survives_a_missing_lsappinfo(monkeypatch):
 
 @pytest.mark.parametrize(
     "idle_nanoseconds, expected",
-    [(0, "active"), (299 * 1_000_000_000, "active"), (301 * 1_000_000_000, "idle")],
+    [
+        (0, "active"),
+        ((adapters.IDLE_AFTER_SECONDS - 1) * 1_000_000_000, "active"),
+        ((adapters.IDLE_AFTER_SECONDS + 1) * 1_000_000_000, "idle"),
+    ],
 )
 def test_activity_state_thresholds_on_hid_idle_time(monkeypatch, idle_nanoseconds, expected):
     monkeypatch.setattr(
@@ -56,6 +60,7 @@ def test_darwin_selects_the_mac_adapter(monkeypatch):
 
 
 def test_linux_activity_state_uses_x11_screensaver_when_available(monkeypatch):
+    monkeypatch.setattr(adapters.LinuxAdapter, "_gnome_extension_idle", lambda: None)
     monkeypatch.setattr(adapters.LinuxAdapter, "_x11_screensaver_idle", lambda: 100_000)
     assert adapters.LinuxAdapter._activity_state() == "active"
 
