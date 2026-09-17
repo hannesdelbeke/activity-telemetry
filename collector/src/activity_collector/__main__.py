@@ -2,22 +2,26 @@
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import logging
 import os
+import signal
 import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .adapters import create_adapter, sleep_interval
+from .adapters import IDLE_AFTER_SECONDS, create_adapter, sleep_interval
+from .buffer import InactivityBuffer
 from .spool import Spool
 
 
-def _event(machine_id: str, app: str, state: str) -> dict:
-    occurred_at = datetime.now(timezone.utc).isoformat()
+def _event(machine_id: str, app: str, state: str, occurred_at: str | None = None) -> dict:
+    if occurred_at is None:
+        occurred_at = datetime.now(timezone.utc).isoformat()
     digest = hashlib.sha256(f"{machine_id}:{occurred_at}:{app}:{state}".encode()).hexdigest()
     return {
         "event_id": digest,
@@ -105,13 +109,37 @@ def main() -> None:
         logging.info("no ingest URL and write token, spooling locally to %s only", spool_path)
 
     adapter = create_adapter()
+    buffer = InactivityBuffer(idle_threshold_seconds=IDLE_AFTER_SECONDS)
+
+    def _shutdown_flush(*args) -> None:
+        for sample in buffer.flush_all():
+            spool.add(_event(machine_id, sample.app, sample.activity_state, sample.occurred_at))
+        if ingest_url and token:
+            try:
+                _flush(spool, ingest_url, token, retention_days)
+            except Exception:
+                pass
+
+    atexit.register(_shutdown_flush)
+    try:
+        signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+        signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+    except (ValueError, AttributeError):
+        pass
+
     while True:
         # A daemon that dies on a transient fault collects nothing until someone
         # notices, which is the failure the local spool exists to prevent. Every
         # step below is therefore allowed to fail without ending the loop.
         try:
             snapshot = adapter.snapshot()
-            spool.add(_event(machine_id, snapshot.app, snapshot.activity_state))
+            ready_samples = buffer.process(
+                app=snapshot.app,
+                state=snapshot.activity_state,
+                idle_ms=snapshot.idle_ms,
+            )
+            for sample in ready_samples:
+                spool.add(_event(machine_id, sample.app, sample.activity_state, sample.occurred_at))
         except Exception:
             logging.exception("snapshot failed, skipping this interval")
 

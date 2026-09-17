@@ -18,6 +18,7 @@ IDLE_AFTER_SECONDS = int(os.environ.get("ACTIVITY_IDLE_SECONDS", os.environ.get(
 class Snapshot:
     app: str
     activity_state: str
+    idle_ms: int | None = None
 
 
 class Adapter:
@@ -27,7 +28,7 @@ class Adapter:
 
 class GenericAdapter(Adapter):
     def snapshot(self) -> Snapshot:
-        return Snapshot(f"platform:{platform.system().lower()}", "active")
+        return Snapshot(f"platform:{platform.system().lower()}", "active", 0)
 
 
 class LinuxAdapter(Adapter):
@@ -35,7 +36,7 @@ class LinuxAdapter(Adapter):
         # A locked screen is checked first, because it is the one state where
         # every other source gives a confidently wrong answer.
         if self._screen_locked():
-            return Snapshot("locked", "idle")
+            return Snapshot("locked", "idle", 0)
 
         # On Wayland, the GNOME extension is the only source that works.
         # On X11, it is absent and the existing X11 mechanisms run instead.
@@ -54,7 +55,8 @@ class LinuxAdapter(Adapter):
                         app = window[:128]
                 except (OSError, subprocess.SubprocessError):
                     pass
-        return Snapshot(app, self._activity_state())
+        _, idle_ms = self.idle_reading()
+        return Snapshot(app, self._activity_state(), idle_ms)
 
     @staticmethod
     def _screen_locked() -> bool:
