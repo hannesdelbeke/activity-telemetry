@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import platform
 import re
 import shutil
@@ -10,7 +11,7 @@ import time
 from dataclasses import dataclass
 
 # Seconds without a keyboard or pointer event before the system is reported idle.
-IDLE_AFTER_SECONDS = 300
+IDLE_AFTER_SECONDS = int(os.environ.get("ACTIVITY_IDLE_SECONDS", os.environ.get("IDLE_AFTER_SECONDS", 120)))
 
 
 @dataclass(frozen=True)

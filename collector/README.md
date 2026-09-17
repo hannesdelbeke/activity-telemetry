@@ -69,7 +69,7 @@ the OS, and neither needs an Accessibility or Screen Recording grant — reading
 the frontmost process through System Events would, which is why `lsappinfo` is
 used instead. Only the application name is read, never the window title.
 
-Idle is reported after `IDLE_AFTER_SECONDS` in `adapters.py`, 300 by default.
+Idle is reported after `IDLE_AFTER_SECONDS` in `adapters.py`, 120 (2 minutes) by default.
 
 ### Linux
 

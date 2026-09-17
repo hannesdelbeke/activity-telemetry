@@ -44,7 +44,7 @@ PYTHONPATH=collector/src python -c \
 
 On Wayland without the extension that prints `app='unknown'`. With it, the real
 application. Move the mouse and it reports `active`; leave the machine alone for
-longer than `IDLE_AFTER_SECONDS` in `adapters.py`, 300 by default, and it reports
+longer than `IDLE_AFTER_SECONDS` in `adapters.py`, 120 (2 minutes) by default, and it reports
 `idle`.
 
 End to end, once the collector is running, the spool is at
