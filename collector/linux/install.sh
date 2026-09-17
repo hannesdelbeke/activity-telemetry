@@ -26,6 +26,7 @@ if [ ! -f "$config/env" ]; then
 # Generic device label, never a personal or employer name.
 ACTIVITY_MACHINE_ID=personal-linux
 # Leave the next two unset to spool locally without uploading anything.
+# Comma-separate addresses to give one sink a backup, most preferred first.
 #ACTIVITY_INGEST_URL=http://homeassistant.local:8788/api/ingest
 #ACTIVITY_WRITE_TOKEN=
 #ACTIVITY_INTERVAL_SECONDS=30

@@ -43,14 +43,57 @@ def _post(url: str, token: str, events: list[dict]) -> None:
             raise RuntimeError(f"ingest returned HTTP {response.status}")
 
 
-def _flush(spool: Spool, ingest_url: str, token: str, retention_days: int) -> None:
-    """Upload one batch. Anything not confirmed stays spooled for the next pass."""
+class IngestUnreachable(RuntimeError):
+    """No configured ingest address accepted the batch."""
+
+
+def _ingest_urls(raw: str | None) -> list[str]:
+    """The configured ingest addresses, most preferred first.
+
+    One sink can answer on more than one address -- ours has a cabled interface
+    and a wifi dongle -- and which of them is up is exactly what an afternoon of
+    rewiring changes. `ACTIVITY_INGEST_URL` therefore takes a comma-separated
+    list, so moving the box costs a reordering instead of a silent outage. A
+    single address parses as a list of one, which is what every old config is.
+    """
+    return [part.strip() for part in (raw or "").split(",") if part.strip()]
+
+
+def _prefer(urls: list[str], accepted: str) -> bool:
+    """Move the address that answered to the front, in place; say whether it moved.
+
+    Without this a dead primary costs a full connect timeout on every interval
+    for as long as it stays dead, which at a 30s interval is most of the
+    interval spent dialling a machine that is not there.
+    """
+    if accepted not in urls or urls[0] == accepted:
+        return False
+    urls.remove(accepted)
+    urls.insert(0, accepted)
+    return True
+
+
+def _flush(spool: Spool, ingest_urls: list[str], token: str, retention_days: int) -> str | None:
+    """Upload one batch, trying each address in turn.
+
+    Returns the address that accepted it, or None when there was nothing to
+    send. Anything not confirmed stays spooled for the next pass.
+    """
     pending = spool.pending()
     if not pending:
-        return
-    _post(ingest_url, token, [item["event"] for item in pending])
-    spool.mark_synced(item["event_id"] for item in pending)
-    spool.prune_synced(retention_days)
+        return None
+    events = [item["event"] for item in pending]
+    failures = []
+    for url in ingest_urls:
+        try:
+            _post(url, token, events)
+        except (OSError, urllib.error.URLError, RuntimeError) as error:
+            failures.append(f"{url}: {error}")
+            continue
+        spool.mark_synced(item["event_id"] for item in pending)
+        spool.prune_synced(retention_days)
+        return url
+    raise IngestUnreachable("; ".join(failures))
 
 
 def diagnose() -> int:
@@ -103,10 +146,12 @@ def main() -> None:
     spool = Spool(spool_path)
     interval = int(os.environ.get("ACTIVITY_INTERVAL_SECONDS", "30"))
     retention_days = int(os.environ.get("ACTIVITY_SPOOL_RETENTION_DAYS", "7"))
-    ingest_url = os.environ.get("ACTIVITY_INGEST_URL")
+    ingest_urls = _ingest_urls(os.environ.get("ACTIVITY_INGEST_URL"))
     token = os.environ.get("ACTIVITY_WRITE_TOKEN")
-    if not (ingest_url and token):
+    if not (ingest_urls and token):
         logging.info("no ingest URL and write token, spooling locally to %s only", spool_path)
+    elif len(ingest_urls) > 1:
+        logging.info("ingest addresses, in order: %s", ", ".join(ingest_urls))
 
     adapter = create_adapter()
     buffer = InactivityBuffer(idle_threshold_seconds=IDLE_AFTER_SECONDS)
@@ -114,9 +159,9 @@ def main() -> None:
     def _shutdown_flush(*args) -> None:
         for sample in buffer.flush_all():
             spool.add(_event(machine_id, sample.app, sample.activity_state, sample.occurred_at))
-        if ingest_url and token:
+        if ingest_urls and token:
             try:
-                _flush(spool, ingest_url, token, retention_days)
+                _flush(spool, ingest_urls, token, retention_days)
             except Exception:
                 pass
 
@@ -143,9 +188,11 @@ def main() -> None:
         except Exception:
             logging.exception("snapshot failed, skipping this interval")
 
-        if ingest_url and token:
+        if ingest_urls and token:
             try:
-                _flush(spool, ingest_url, token, retention_days)
+                accepted = _flush(spool, ingest_urls, token, retention_days)
+                if accepted and _prefer(ingest_urls, accepted):
+                    logging.warning("ingest failed over to %s", accepted)
             except (OSError, urllib.error.URLError, RuntimeError) as error:
                 # Unsent events keep synced_at NULL, so the next pass retries them.
                 logging.warning("ingest failed, %s events still spooled: %s", len(spool.pending()), error)

@@ -35,7 +35,7 @@ Environment variables:
 | --- | --- | --- |
 | `ACTIVITY_MACHINE_ID` | yes | Non-identifying device label |
 | `ACTIVITY_SPOOL` | no | SQLite path; defaults to a user cache path |
-| `ACTIVITY_INGEST_URL` | no | Batch ingest endpoint; HTTPS outside a trusted LAN |
+| `ACTIVITY_INGEST_URL` | no | Batch ingest endpoint, or a comma-separated list of them; HTTPS outside a trusted LAN |
 | `ACTIVITY_WRITE_TOKEN` | no | Device-scoped write token |
 | `ACTIVITY_INTERVAL_SECONDS` | no | Poll interval; defaults to 30 |
 | `ACTIVITY_SPOOL_RETENTION_DAYS` | no | Days to keep events the sink has confirmed; defaults to 7 |
@@ -47,6 +47,22 @@ Home Assistant advertises an IPv6 link-local address over mDNS, clients try it
 first, and the add-on's published port is IPv4-only, so the connection is reset
 before the request is sent. The symptom is `Connection reset by peer` against
 the hostname while the same request to the address succeeds.
+
+### More than one address for the same sink
+
+A sink with two interfaces has two addresses, and pinning the collector to one
+of them turns a cable change into a silent outage: the spool keeps every event,
+so nothing is lost, but nothing arrives either until someone reads the log.
+List them instead, most preferred first:
+
+```sh
+ACTIVITY_INGEST_URL=http://192.168.1.15:8788/api/ingest,http://192.168.1.204:8788/api/ingest
+```
+
+Each flush tries them in order and stops at the first that accepts the batch.
+Whichever answered is tried first next time, so a dead primary costs one connect
+timeout rather than one per interval. A failover logs `ingest failed over to`;
+when every address is refused the log names them all.
 
 The collector never deletes an event the sink has not acknowledged. An ingest
 failure is logged and retried on the next interval, so a sink that is down or
